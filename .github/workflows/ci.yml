@@ -1,0 +1,70 @@
+name: CI
+
+# Runs on every push and PR. This is the compatibility gate for new
+# plugin/algo development: if you add a scoring policy to
+# k8s_sim/policies.POLICIES, this pipeline automatically runs the
+# conformance + integration test suite against it (see tests/test_policy_contract.py
+# and tests/test_cluster.py) and fails with a precise, per-policy message if
+# it isn't compatible.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch: {}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install lint tools
+        run: pip install flake8
+      - name: Syntax / undefined-name check (fails the build on real errors)
+        run: flake8 k8s_sim tests --select=E9,F63,F7,F82 --show-source
+      - name: Style check (report only, does not fail the build)
+        run: flake8 k8s_sim tests --max-line-length=120 --exit-zero
+
+  test:
+    needs: lint
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test dependencies
+        run: pip install pytest pytest-cov
+
+      - name: Run unit + conformance + integration tests
+        run: python3 -m pytest -v --cov=k8s_sim --cov-report=term-missing
+
+      - name: Smoke-test the synthetic demo
+        run: python3 demo.py
+
+      - name: Smoke-test the real-trace demo
+        run: python3 trace_demo.py openb_pod_list_gpushare100.csv 200
+
+  new-policy-check:
+    # Separate, clearly-named job so a failure here reads unambiguously as
+    # "a scoring policy is not compatible" rather than a generic test failure.
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      - name: Verify every registered policy passes the compatibility contract
+        run: python3 -m pytest tests/test_policy_contract.py tests/test_cluster.py -v
