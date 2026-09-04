@@ -94,7 +94,7 @@ def load_pods_csv(path: Optional[str] = None, limit: Optional[int] = None,
     pods = []
     for row in rows:
         num_gpu = int(row["num_gpu"])
-        gpu_milli = int(row["gpu_milli"]) if row["gpu_milli"] not in ("", None) else 0
+        gpu_milli = int(row["gpu_milli"]) if row.get("gpu_milli", "") not in ("", None) else 0
         pod = PodResource(
             milli_cpu=int(row["cpu_milli"]),
             milli_gpu=gpu_milli if num_gpu > 0 else 0,
@@ -106,9 +106,9 @@ def load_pods_csv(path: Optional[str] = None, limit: Optional[int] = None,
             pod=pod,
             qos=row.get("qos", ""),
             pod_phase=row.get("pod_phase", ""),
-            creation_time=int(row["creation_time"]),
-            deletion_time=int(row["deletion_time"]),
-            scheduled_time=int(row["scheduled_time"]) if row["scheduled_time"] not in ("", None) else -1,
+            creation_time=int(row["creation_time"]) if row.get("creation_time", "") not in ("", None) else -1,
+            deletion_time=int(row["deletion_time"]) if row.get("deletion_time", "") not in ("", None) else -1,
+            scheduled_time=int(row["scheduled_time"]) if row.get("scheduled_time", "") not in ("", None) else -1,
         ))
     return pods
 

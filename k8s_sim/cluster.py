@@ -25,6 +25,7 @@ class ScheduleResult:
 class Cluster:
     def __init__(self, nodes: Sequence[NodeResource]):
         self.nodes: Dict[str, NodeResource] = {n.name: n.copy() for n in nodes}
+        self._policy_state: Dict[str, dict] = {}  # per-policy persistent scratchpad (e.g. round-robin counter)
 
     def node_list(self) -> List[NodeResource]:
         return list(self.nodes.values())
@@ -47,6 +48,7 @@ class Cluster:
             ctx["typical_pods"] = typical_pods
         if affinity_key is not None:
             ctx["affinity_key"] = affinity_key
+        ctx["_cluster_state"] = self._policy_state.setdefault(policy, {})
 
         prepare = policy_mod.PREPARE_HOOKS.get(policy)
         if prepare:

@@ -9,6 +9,7 @@ Run:  python3 demo.py
 import random
 
 from k8s_sim import PodResource, NodeResource, TargetPod, Cluster
+from k8s_sim import policies as policy_mod
 from k8s_sim.fragmentation import build_typical_pods_uniform
 
 
@@ -87,7 +88,7 @@ def run_policy(policy: str, n_pods: int = 85) -> dict:
 
 
 def main():
-    policies = ["random", "best-fit", "dot-product", "gpu-packing", "gpu-clustering", "fgd"]
+    policies = list(policy_mod.POLICIES.keys())
     rows = [run_policy(p) for p in policies]
 
     header = f"{'policy':<15}{'scheduled':>10}{'unscheduled':>13}{'cpu_util':>10}{'gpu_util':>10}{'frag_ratio':>12}"

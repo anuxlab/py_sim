@@ -15,6 +15,15 @@ def my_policy_score(node: NodeResource, pod: PodResource, ctx: dict) -> float:
     return score  # must be in [MIN_NODE_SCORE, MAX_NODE_SCORE] == [0, 100]
 ```
 
+If you're porting a known algorithm from the literature (as opposed to a
+one-off heuristic), add a one-line citation in the docstring, e.g.:
+
+```python
+def my_policy_score(node: NodeResource, pod: PodResource, ctx: dict) -> float:
+    """One-line description of the strategy.
+    Reference: Author et al., "Paper Title," Venue Year."""
+```
+
 Then register it:
 
 ```python
@@ -70,6 +79,9 @@ and once green your policy is confirmed compatible and integrated.
 1. **lint** — flake8 syntax/undefined-name check (hard fail) + style report
 2. **test** — the full suite (`pytest --cov=k8s_sim`) on Python 3.9–3.12,
    plus a smoke run of `demo.py` and `trace_demo.py`
+   plus a smoke run of `demo.py`, `trace_demo.py`, and a small
+   `run_benchmark_suite` + `plotting` call (catches breakage in the
+   experiments/analysis pipeline, not just the scoring functions)
 3. **new-policy-check** — re-runs just the conformance + integration suites
    as a separately-named job, so a red ❌ here unambiguously means "a
    registered policy failed the compatibility contract," not some unrelated

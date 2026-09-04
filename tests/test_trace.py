@@ -41,6 +41,20 @@ def test_load_pods_csv_sample_is_reproducible_with_seed():
     assert [tp.pod.name for tp in a] == [tp.pod.name for tp in b]
 
 
+def test_load_pods_csv_handles_reduced_column_variants():
+    """openb_pod_list_multigpu*.csv only has 5 columns (no qos/phase/timestamps) --
+    the loader must not KeyError on those, it should fall back to -1 / "" defaults."""
+    import glob
+    reduced_variants = glob.glob(os.path.join(DATA_DIR, "openb_pod_list_multigpu*.csv"))
+    assert reduced_variants, "expected at least one multigpu*.csv variant in data/csv/"
+    for path in reduced_variants:
+        pods = load_pods_csv(path=path, limit=20)
+        assert len(pods) == 20
+        for tp in pods:
+            assert tp.creation_time == -1
+            assert tp.pod.milli_cpu > 0 or tp.pod.gpu_number >= 0
+
+
 def test_build_typical_pods_from_trace():
     trace_pods = load_pods_csv(limit=500, sample=True, seed=1)
     typical = build_typical_pods(trace_pods)

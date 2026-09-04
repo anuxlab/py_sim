@@ -45,6 +45,128 @@ def random_prepare(nodes: Sequence[NodeResource], pod: PodResource, ctx: dict) -
 
 
 # ---------------------------------------------------------------------------
+# 1b. First-Fit
+# ---------------------------------------------------------------------------
+# Classic online bin-packing heuristic: place each item in the first bin
+# (here: node, in cluster-list order) that has room for it.
+# Reference: D. S. Johnson, "Fast Algorithms for Bin Packing,"
+# J. Comput. Syst. Sci., 8(3):272-314, 1974 (and his 1973 MIT PhD thesis,
+# where First-Fit and First-Fit-Decreasing were introduced/analyzed).
+
+def first_fit_prepare(nodes: Sequence[NodeResource], pod: PodResource, ctx: dict) -> None:
+    ctx["_ff_order"] = {n.name: i for i, n in enumerate(nodes)}
+
+
+def first_fit_score(node: NodeResource, pod: PodResource, ctx: dict) -> float:
+    order = ctx.get("_ff_order", {})
+    idx = order.get(node.name, 0)
+    return max(MAX_NODE_SCORE - idx, MIN_NODE_SCORE)
+
+
+# ---------------------------------------------------------------------------
+# 1c. Worst-Fit
+# ---------------------------------------------------------------------------
+# The mirror image of Best-Fit: place each item in the bin that will have
+# the MOST room left over, spreading load rather than consolidating it.
+# Reference: E. G. Coffman Jr., M. R. Garey, D. S. Johnson,
+# "Approximation Algorithms for Bin Packing: A Survey," in Approximation
+# Algorithms for NP-Hard Problems, PWS Publishing, 1996 (surveys First-Fit,
+# Best-Fit, Worst-Fit and their decreasing variants).
+
+def worst_fit_score(node: NodeResource, pod: PodResource, ctx: dict) -> float:
+    free_vec = node.to_resource_vec()
+    req_vec = pod.to_resource_vec()
+    max_spec = [MAX_SPEC_CPU, MAX_SPEC_GPU]
+    weights = [0.5, 0.5]
+
+    score = 0.0
+    for f, r, m, w in zip(free_vec, req_vec, max_spec, weights):
+        if f < r:
+            return MIN_NODE_SCORE
+        score += (f - r) / m * w
+    return min(score * MAX_NODE_SCORE, MAX_NODE_SCORE)  # larger leftover -> higher score
+
+
+# ---------------------------------------------------------------------------
+# 1d. Round-Robin
+# ---------------------------------------------------------------------------
+# Cycle through feasible nodes in order, one pod per node per turn, rather
+# than scoring by resource state at all. A standard fairness/simplicity
+# baseline in scheduling theory (e.g. round-robin CPU scheduling, Kleinrock's
+# time-sharing analysis) and a common naive baseline in cluster-scheduler
+# evaluations (e.g. used alongside Random in Grandl et al., "Multi-Resource
+# Packing for Cluster Schedulers," SIGCOMM 2014).
+#
+# Needs persistent state ACROSS pod placements (not just within one pod's
+# scoring call), so it reads/writes ctx["_cluster_state"], which
+# Cluster.schedule_pod populates from a dict that lives on the Cluster
+# instance itself and survives across calls.
+
+def round_robin_prepare(nodes: Sequence[NodeResource], pod: PodResource, ctx: dict) -> None:
+    state = ctx.setdefault("_cluster_state", {})
+    counter = state.get("rr_counter", 0)
+    if nodes:
+        ctx["_rr_pick"] = nodes[counter % len(nodes)].name
+        state["rr_counter"] = counter + 1
+    else:
+        ctx["_rr_pick"] = None
+
+
+def round_robin_score(node: NodeResource, pod: PodResource, ctx: dict) -> float:
+    return MAX_NODE_SCORE if node.name == ctx.get("_rr_pick") else MIN_NODE_SCORE
+
+
+# ---------------------------------------------------------------------------
+# 1e. DRF-inspired (Dominant Resource Fairness)
+# ---------------------------------------------------------------------------
+# DRF equalizes each tenant's *dominant share* (their largest fractional
+# share of any resource) across a shared cluster. We repurpose the same
+# principle at placement time as a load-balancing heuristic: prefer the node
+# whose dominant resource share (max across CPU/GPU of used/capacity) would
+# end up LOWEST after placing the pod, i.e. keep every node's most
+# constrained resource as balanced as possible across the cluster.
+# Reference: A. Ghodsi, M. Zaharia, B. Hindman, A. Konwinski, S. Shenker,
+# I. Stoica, "Dominant Resource Fairness: Fair Allocation of Multiple
+# Resource Types," NSDI 2011.
+
+def drf_score(node: NodeResource, pod: PodResource, ctx: dict) -> float:
+    cpu_used_after = (node.milli_cpu_capacity - node.milli_cpu_left) + pod.milli_cpu
+    cpu_share = cpu_used_after / node.milli_cpu_capacity if node.milli_cpu_capacity else 0.0
+
+    if node.gpu_number > 0:
+        gpu_cap = node.gpu_number * MILLI
+        gpu_used_after = (gpu_cap - node.total_milli_gpu_left()) + pod.total_milli_gpu()
+        gpu_share = gpu_used_after / gpu_cap if gpu_cap else 0.0
+    else:
+        gpu_share = 0.0
+
+    dominant_share = max(cpu_share, gpu_share)
+    return max(0.0, (1.0 - dominant_share)) * MAX_NODE_SCORE
+
+
+# ---------------------------------------------------------------------------
+# 1f. Least-Requested-Priority (Kubernetes default scheduler baseline)
+# ---------------------------------------------------------------------------
+# The default kube-scheduler strategy: prefer the node with the most free
+# capacity *proportionally*, spreading pods across the cluster rather than
+# packing them. This is the LeastAllocated strategy of the built-in
+# NodeResourcesFit score plugin.
+# Reference: Kubernetes documentation, "Scheduler Configuration - Scheduling
+# Plugins / NodeResourcesFit," https://kubernetes.io/docs/reference/scheduling/config/#scheduling-plugins
+
+def least_requested_score(node: NodeResource, pod: PodResource, ctx: dict) -> float:
+    cpu_free_frac = (node.milli_cpu_left - pod.milli_cpu) / node.milli_cpu_capacity \
+        if node.milli_cpu_capacity else 0.0
+    if node.gpu_number > 0:
+        gpu_cap = node.gpu_number * MILLI
+        gpu_free_frac = (node.total_milli_gpu_left() - pod.total_milli_gpu()) / gpu_cap if gpu_cap else 0.0
+        avg_free_frac = (cpu_free_frac + gpu_free_frac) / 2.0
+    else:
+        avg_free_frac = cpu_free_frac
+    return max(0.0, min(1.0, avg_free_frac)) * MAX_NODE_SCORE
+
+
+# ---------------------------------------------------------------------------
 # 2. Best-Fit
 # ---------------------------------------------------------------------------
 
@@ -199,8 +321,13 @@ def fgd_score(node: NodeResource, pod: PodResource, ctx: dict) -> float:
 
 POLICIES: Dict[str, Callable[[NodeResource, PodResource, dict], float]] = {
     "random": random_score,
+    "first-fit": first_fit_score,
+    "worst-fit": worst_fit_score,
+    "round-robin": round_robin_score,
     "best-fit": best_fit_score,
     "dot-product": dot_product_score,
+    "drf": drf_score,
+    "least-requested": least_requested_score,
     "gpu-packing": gpu_packing_score,
     "gpu-clustering": gpu_clustering_score,
     "fgd": fgd_score,
@@ -210,4 +337,6 @@ POLICIES: Dict[str, Callable[[NodeResource, PodResource, dict], float]] = {
 # (mirrors the framework's PreScore extension point).
 PREPARE_HOOKS: Dict[str, Callable[[Sequence[NodeResource], PodResource, dict], None]] = {
     "random": random_prepare,
+    "first-fit": first_fit_prepare,
+    "round-robin": round_robin_prepare,
 }

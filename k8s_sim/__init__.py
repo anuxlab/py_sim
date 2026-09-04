@@ -15,6 +15,7 @@ from .fragmentation import TargetPod, node_gpu_share_frag_amount_score, get_node
 from .cluster import Cluster
 from . import policies
 from . import trace
+from . import experiment
 
 __all__ = [
     "PodResource",
@@ -25,4 +26,5 @@ __all__ = [
     "Cluster",
     "policies",
     "trace",
+    "experiment",
 ]
