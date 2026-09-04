@@ -44,7 +44,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install test dependencies
-        run: pip install pytest pytest-cov
+        run: pip install pytest pytest-cov pandas matplotlib
 
       - name: Run unit + conformance + integration tests
         run: python3 -m pytest -v --cov=k8s_sim --cov-report=term-missing
@@ -54,6 +54,22 @@ jobs:
 
       - name: Smoke-test the real-trace demo
         run: python3 trace_demo.py openb_pod_list_gpushare100.csv 200
+
+      - name: Smoke-test the benchmark + plotting pipeline
+        run: |
+          python3 -c "
+          from k8s_sim.experiment import run_benchmark_suite
+          from k8s_sim import plotting
+          run_benchmark_suite(
+              policies=['random', 'fgd', 'best-fit'],
+              workloads=['openb_pod_list_gpushare100.csv'],
+              pod_counts=(30,), seeds=(0,), node_sample_size=30,
+              out_path='/tmp/ci_bench.csv',
+          )
+          df = plotting.load_results('/tmp/ci_bench.csv')
+          plotting.plot_frag_ratio_by_policy(df, out_name='ci_smoke.png')
+          print('benchmark + plotting pipeline OK')
+          "
 
   new-policy-check:
     # Separate, clearly-named job so a failure here reads unambiguously as
@@ -68,3 +84,32 @@ jobs:
       - run: pip install pytest
       - name: Verify every registered policy passes the compatibility contract
         run: python3 -m pytest tests/test_policy_contract.py tests/test_cluster.py -v
+
+  benchmark:
+    # Actually runs the benchmark suite and uploads the CSV + plots as a
+    # downloadable Actions artifact -- this is what produces something you
+    # can look at, unlike the "test" job's throwaway /tmp smoke check.
+    # Runs on every push to main plus manual dispatch (Actions tab -> this
+    # workflow -> "Run workflow"), not on every PR, since it's slower than
+    # the test suite.
+    needs: test
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt -r requirements-analysis.txt
+      - name: Run benchmark suite (fast preset) and generate plots
+        run: python3 experiments/run_benchmark.py --preset fast
+      - name: Upload results + plots
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            experiments/results/*.csv
+            experiments/plots/*.png
+          if-no-files-found: error
+          retention-days: 30

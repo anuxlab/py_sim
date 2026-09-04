@@ -18,7 +18,18 @@ running and CSV-writing; `k8s_sim/plotting.py` does the charting. Both are
 importable directly if you want a custom sweep or a notebook workflow
 instead of the CLI.
 
-## Quickstart
+## Getting results from CI
+
+`.github/workflows/ci.yml` has a `benchmark` job (runs on push to `main` and
+on manual dispatch from the Actions tab) that runs the `fast` preset and
+uploads `experiments/results/*.csv` + `experiments/plots/*.png` as a
+downloadable Actions artifact named `benchmark-results` -- go to your repo's
+**Actions tab → the workflow run → Artifacts** at the bottom of the run
+summary. The `test` job's own benchmark step is a separate, much smaller
+smoke check that writes to `/tmp` and is thrown away; it only proves the
+pipeline doesn't crash, it isn't meant to produce anything to look at.
+
+## Quickstart (running it yourself)
 
 ```bash
 pip install -r requirements-analysis.txt   # pandas + matplotlib, on top of requirements-dev.txt
