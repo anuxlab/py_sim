@@ -34,6 +34,8 @@ in a notebook.
 | `demo.py` | `example/` + `experiments/` | Compare all registered policies on a synthetic GPU-sharing workload |
 | `trace_demo.py` | `experiments/` | Compare all registered policies on the **real** production trace data |
 | `experiments/` | `experiments/` | Results storage, deep analysis, and plots — see `experiments/README.md` |
+| `k8s_sim/topology.py`, `k8s_sim/htafm.py` | — (new, research prototype) | H-TAFM: topology-aware, multi-resource fragmentation metric + scheduler — see `docs/HTAFM.md` |
+| `htafm_demo.py` | — (new) | Compare H-TAFM's 3 variants against FGD/Best-Fit/Random |
 | `tests/` | — (new) | Conformance + integration test suite; see "CI / adding a new policy" below |
 | `.github/workflows/ci.yml` | — (new) | GitHub Actions pipeline that runs the test suite on every push/PR |
 
@@ -135,6 +137,22 @@ pod count and get a fragmentation-vs-load line chart. This is the Python
 equivalent of the original's `experiments/run_scripts` → `scripts/analysis.py`
 → `experiments/analysis/merge_*.py` → `experiments/plot/plot_*.py` pipeline,
 collapsed into one script since there's no Go binary or log-scraping step.
+
+## H-TAFM: a topology-aware, multi-resource extension (research prototype)
+
+`k8s_sim/topology.py` + `k8s_sim/htafm.py` implement H-TAFM (Hypergraph-based
+Topology-Aware Fragmentation Metric) — a proposed extension of FGD to
+CPU+Memory+GPU and a synthetic NUMA/Socket/Server/Rack hierarchy, scored via
+a weighted hypergraph and a gradient-descent scheduler analogous to FGD's.
+It operates at NUMA-vertex granularity (finer than the rest of this repo's
+whole-node placement), so it's its own module rather than another
+`policies.POLICIES` entry. **See `docs/HTAFM.md`** for the full
+methodology-to-code mapping, documented simplifications, and two concrete
+findings from testing it against the real trace data: TAFI-Entropy violates
+its own claimed monotonicity property (TAFI-Cut and TAFI-Hier don't), and
+NUMA-granularity placement can reject large multi-GPU jobs that
+node-granularity placement accepts. Run `python3 htafm_demo.py 300` to
+compare all 3 variants against FGD/Best-Fit/Random on real trace data.
 
 ## What's ported faithfully
 

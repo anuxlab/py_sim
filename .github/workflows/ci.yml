@@ -55,6 +55,9 @@ jobs:
       - name: Smoke-test the real-trace demo
         run: python3 trace_demo.py openb_pod_list_gpushare100.csv 200
 
+      - name: Smoke-test the H-TAFM demo
+        run: python3 htafm_demo.py 50
+
       - name: Smoke-test the benchmark + plotting pipeline
         run: |
           python3 -c "
