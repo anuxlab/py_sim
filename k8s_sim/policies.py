@@ -340,3 +340,121 @@ PREPARE_HOOKS: Dict[str, Callable[[Sequence[NodeResource], PodResource, dict], N
     "first-fit": first_fit_prepare,
     "round-robin": round_robin_prepare,
 }
+
+# ==================== HTAFM integration ====================
+from .htafm import Topology, TopoDemand, HTAFMScheduler, HTAFMConfig
+from .topology import TopoVertex
+from .resource import NodeResource, PodResource
+
+def _build_topology_from_nodes(nodes: List[NodeResource]) -> Topology:
+    """Convert a list of NodeResource objects to a HTAFM Topology.
+       Returns a topology with vertices as a dict (id -> vertex) and no hyperedges."""
+    vertices_dict = {}
+    for node in nodes:
+        # ---- CPU ----
+        milli_cpu_cap = getattr(node, 'milli_cpu_capacity', 0)
+
+        # ---- Memory ----
+        memory_mib_cap = getattr(node, 'memory_mib_capacity', None)
+        if memory_mib_cap is None:
+            memory_mib_cap = getattr(node, 'memory_capacity_mib', 0)
+
+        # ---- GPU per‑device capacity ----
+        gpu_count = getattr(node, 'gpu_number', 0)
+        if gpu_count > 0:
+            per_card_milli = getattr(node, 'gpu_capacity_per_card_milli', None)
+            if per_card_milli is None:
+                total_milli = getattr(node, 'milli_gpu_capacity', None)
+                if total_milli is not None:
+                    per_card_milli = total_milli // gpu_count
+                else:
+                    per_card_milli = 1000   # default: 1 GPU = 1000 milli
+        else:
+            per_card_milli = 0
+        milli_gpu_left_list = [per_card_milli] * gpu_count
+
+        vertex = TopoVertex(
+            id=node.name,
+            node_name=node.name,
+            socket_id="",
+            rack_id="",
+            milli_cpu_capacity=milli_cpu_cap,
+            milli_cpu_left=milli_cpu_cap,
+            memory_mib_capacity=memory_mib_cap,
+            memory_mib_left=memory_mib_cap,
+            milli_gpu_left_list=milli_gpu_left_list,
+            gpu_type=getattr(node, 'gpu_type', '')
+        )
+        # Store in dict with id as key
+        vertices_dict[vertex.id] = vertex
+
+    # Return Topology with dict of vertices and empty dict for edges
+    return Topology(vertices_dict, {})
+
+def htafm_scorer(node: NodeResource, pod: PodResource, ctx: dict) -> float:
+    """Dummy scorer: HTAFM does its own scoring internally."""
+    return MAX_NODE_SCORE   # maximum score, so it's always eligible
+
+def htafm_schedule(nodes: List[NodeResource], pods: List[PodResource],
+                   typical_pods=None):
+    # Build topology
+    topology = _build_topology_from_nodes(nodes)
+    config = HTAFMConfig(variant="cut")
+    scheduler = HTAFMScheduler(topology, config)
+
+    # Convert pods to TopoDemand
+    demands = []
+    for pod in pods:
+        cpu_milli = getattr(pod, 'milli_cpu_request', getattr(pod, 'milli_cpu', 0))
+        mem_mib = getattr(pod, 'memory_request_mib', getattr(pod, 'memory_mib', 0))
+        gpu_num = getattr(pod, 'gpu_number', 0)
+        if gpu_num > 0:
+            milli_per_gpu = getattr(pod, 'milli_gpu_per_card', None)
+            if milli_per_gpu is None:
+                total_milli = getattr(pod, 'milli_gpu_request', None)
+                if total_milli is not None:
+                    milli_per_gpu = total_milli // gpu_num
+                else:
+                    milli_per_gpu = 1000
+        else:
+            milli_per_gpu = 0
+
+        demand = TopoDemand(
+            name=pod.name,
+            milli_cpu=cpu_milli,
+            memory_mib=mem_mib,
+            milli_gpu=milli_per_gpu,
+            gpu_number=gpu_num,
+            gpu_type=getattr(pod, 'gpu_type', '')
+        )
+        demands.append(demand)
+
+    result = scheduler.schedule(demands)
+
+    # Map vertex ID (which is node.name) back to node name
+    vertex_to_node = {v.id: v.id for v in topology.vertices.values()}
+
+    scheduled = []
+    unscheduled = list(result.unscheduled)
+    for name in result.scheduled:
+        vertex_id = result.placement.get(name)
+        if vertex_id is not None:
+            node_name = vertex_to_node.get(vertex_id)
+            if node_name:
+                scheduled.append((name, node_name))
+            else:
+                unscheduled.append(name)
+        else:
+            unscheduled.append(name)
+
+    unscheduled = list(set(unscheduled))
+
+    class HTAFMScheduleResult:
+        def __init__(self, scheduled, unscheduled):
+            self.scheduled = scheduled
+            self.unscheduled = unscheduled
+
+    return HTAFMScheduleResult(scheduled, unscheduled)
+
+# Register HTAFM policy (score function is dummy; actual scheduling is intercepted)
+POLICIES["htafm"] = htafm_scorer

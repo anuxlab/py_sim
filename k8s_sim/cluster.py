@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
+from .policies import htafm_schedule, POLICIES
 from .resource import NodeResource, PodResource
 from .fragmentation import TargetPod, cluster_frag_ratio
 from . import policies as policy_mod
@@ -118,10 +119,43 @@ class Cluster:
         node, using the SAME gpu_ids schedule_pod_tracked recorded for it."""
         self.nodes[node_name] = self.nodes[node_name].add(pod, gpu_ids=list(gpu_ids))
 
-    def schedule_pods(self, pods: Sequence[PodResource], policy: str,
-                       typical_pods: Optional[Sequence[TargetPod]] = None) -> ScheduleResult:
-        """Schedule a batch of pods, one at a time, in the given order
-        (this is what SchedulePods does in simulator.go)."""
+    def schedule_pods(self, pods: Sequence[PodResource], policy: str, typical_pods: Optional[Sequence[TargetPod]] = None) -> ScheduleResult:
+        """
+        Schedule a batch of pods. For the HTAFM policy, we use the batch scheduler.
+        For all other policies, we schedule pods one at a time in the given order.
+        """
+        # ----- HTAFM batch scheduling -----
+        if policy == "htafm":
+            # Call the HTAFM batch scheduler
+            result = htafm_schedule(self.node_list(), list(pods), typical_pods)
+            # Apply the placements to the cluster
+            scheduled_names = []
+            unscheduled_names = list(result.unscheduled)
+            placement_map = {}
+            for pod_name, node_name in result.scheduled:
+                # Find the pod object
+                pod_obj = next((p for p in pods if p.name == pod_name), None)
+                if pod_obj is None:
+                    continue
+                # Find the node and apply resources
+                node_obj = self.nodes.get(node_name)
+                if node_obj is not None:
+                    # Apply the pod to the node (deduct resources)
+                    self.nodes[node_name] = node_obj.sub(pod_obj)
+                    scheduled_names.append(pod_name)
+                    placement_map[pod_name] = node_name
+                else:
+                    # Node not found -> treat as unscheduled
+                    unscheduled_names.append(pod_name)
+            # Remove duplicates from unscheduled
+            unscheduled_names = list(set(unscheduled_names))
+            return ScheduleResult(
+                scheduled=scheduled_names,
+                unscheduled=unscheduled_names,
+                placement=placement_map
+            )
+
+        # ----- Standard per‑pod scheduling for other policies -----
         result = ScheduleResult()
         for pod in pods:
             node_name = self.schedule_pod(pod, policy, typical_pods=typical_pods)
