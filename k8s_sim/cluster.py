@@ -71,6 +71,53 @@ class Cluster:
 
         return best_node.name
 
+    def schedule_pod_tracked(self, pod: PodResource, policy: str,
+                              typical_pods: Optional[Sequence[TargetPod]] = None,
+                              affinity_key: Optional[str] = None) -> Optional["tuple[str, List[int]]"]:
+        """Same decision logic as schedule_pod, but also returns exactly
+        which GPU device indices were used, so a caller (k8s_sim.simulation)
+        can release precisely those devices later via release_pod() --
+        needed once pods can depart independently of arrival order, which
+        schedule_pod's plain node.sub() doesn't support (see
+        NodeResource.sub_with_gpu_ids's docstring)."""
+        score_fn = policy_mod.POLICIES[policy]
+        candidates = self.feasible_nodes(pod)
+        if not candidates:
+            return None
+
+        ctx: dict = {}
+        if typical_pods is not None:
+            ctx["typical_pods"] = typical_pods
+        if affinity_key is not None:
+            ctx["affinity_key"] = affinity_key
+        ctx["_cluster_state"] = self._policy_state.setdefault(policy, {})
+
+        prepare = policy_mod.PREPARE_HOOKS.get(policy)
+        if prepare:
+            prepare(candidates, pod, ctx)
+
+        best_node, best_score = None, None
+        for node in candidates:
+            s = score_fn(node, pod, ctx)
+            if best_score is None or s > best_score:
+                best_node, best_score = node, s
+
+        chosen = self.nodes[best_node.name]
+        new_node, gpu_ids = chosen.sub_with_gpu_ids(pod)
+        self.nodes[best_node.name] = new_node
+
+        if pod.gpu_number > 0:
+            key = affinity_key or pod.gpu_type or "default"
+            self.nodes[best_node.name].gpu_affinity[key] = \
+                self.nodes[best_node.name].gpu_affinity.get(key, 0) + 1
+
+        return best_node.name, gpu_ids
+
+    def release_pod(self, pod: PodResource, node_name: str, gpu_ids: Sequence[int]) -> None:
+        """Release a previously-placed pod's resources back onto the named
+        node, using the SAME gpu_ids schedule_pod_tracked recorded for it."""
+        self.nodes[node_name] = self.nodes[node_name].add(pod, gpu_ids=list(gpu_ids))
+
     def schedule_pods(self, pods: Sequence[PodResource], policy: str,
                        typical_pods: Optional[Sequence[TargetPod]] = None) -> ScheduleResult:
         """Schedule a batch of pods, one at a time, in the given order

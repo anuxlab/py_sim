@@ -125,6 +125,17 @@ class NodeResource:
         Mirrors simontype.NodeResource.Sub: without explicit gpu_ids, GPUs are
         packed onto the *least sufficient* device first (ascending sort),
         i.e. best-fit-style bin packing at the GPU-device level."""
+        out, _ = self.sub_with_gpu_ids(pod, gpu_ids)
+        return out
+
+    def sub_with_gpu_ids(self, pod: PodResource,
+                          gpu_ids: Optional[List[int]] = None) -> "tuple[NodeResource, List[int]]":
+        """Same as sub(), but also returns exactly which GPU device indices
+        were used -- needed by anything that must later release the SAME
+        devices (e.g. k8s_sim.simulation's departure handling), since without
+        recording this, a later add() with no gpu_ids would re-derive
+        "least sufficient first" against whatever the node's state happens
+        to be *then*, which may no longer match what was actually freed."""
         out = self.copy()
         if out.milli_cpu_left < pod.milli_cpu:
             raise ValueError(f"node {self.name} lacks CPU for pod {pod.repr()}")
@@ -132,19 +143,21 @@ class NodeResource:
 
         need = pod.gpu_number
         if need == 0:
-            return out
+            return out, []
 
         order = gpu_ids if gpu_ids is not None else out.sorted_gpu_left_index_list(ascending=True)
+        used: List[int] = []
         for i in order:
             if need <= 0:
                 break
             if pod.milli_gpu <= out.milli_gpu_left_list[i]:
                 out.milli_gpu_left_list[i] -= pod.milli_gpu
+                used.append(i)
                 need -= 1
         if need > 0:
             raise ValueError(f"node {self.name} failed to accommodate pod {pod.repr()} "
                               f"({need} GPU requests left)")
-        return out
+        return out, used
 
     def add(self, pod: PodResource, gpu_ids: Optional[List[int]] = None) -> "NodeResource":
         """Release `pod`'s resources back onto the node (e.g. on completion/eviction)."""

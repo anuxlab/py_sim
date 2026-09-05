@@ -34,6 +34,8 @@ in a notebook.
 | `demo.py` | `example/` + `experiments/` | Compare all registered policies on a synthetic GPU-sharing workload |
 | `trace_demo.py` | `experiments/` | Compare all registered policies on the **real** production trace data |
 | `experiments/` | `experiments/` | Results storage, deep analysis, and plots — see `experiments/README.md` |
+| `k8s_sim/simulation.py`, `k8s_sim/metrics.py` | — (new) | Time-driven simulation + 7 performance metrics — see `docs/METRICS.md` |
+| `simulation_demo.py` | — (new) | Compare policies on utilization/throughput/waiting/fairness/starvation/latency/interference |
 | `k8s_sim/topology.py`, `k8s_sim/htafm.py` | — (new, research prototype) | H-TAFM: topology-aware, multi-resource fragmentation metric + scheduler — see `docs/HTAFM.md` |
 | `htafm_demo.py` | — (new) | Compare H-TAFM's 3 variants against FGD/Best-Fit/Random |
 | `tests/` | — (new) | Conformance + integration test suite; see "CI / adding a new policy" below |
@@ -137,6 +139,22 @@ pod count and get a fragmentation-vs-load line chart. This is the Python
 equivalent of the original's `experiments/run_scripts` → `scripts/analysis.py`
 → `experiments/analysis/merge_*.py` → `experiments/plot/plot_*.py` pipeline,
 collapsed into one script since there's no Go binary or log-scraping step.
+
+## Performance metrics system: utilization, throughput, waiting time, fairness, starvation, latency, interference
+
+`k8s_sim/simulation.py` + `k8s_sim/metrics.py` add a **time-driven**
+simulation mode (discrete-event: arrivals, a FIFO pending queue, departures
+that release resources) on top of the static one-shot batch mode everything
+else uses — this is what makes cluster utilization *over time*, job
+throughput, waiting time, fairness, starvation, scheduling latency, and
+interference intensity computable at all. **See `docs/METRICS.md`** for the
+full writeup, including a correctness fix this required (tracking exactly
+which GPU devices a pod used so departures release the right capacity) and
+honest caveats on the two metrics that needed something invented (fairness
+needs synthetic tenants — the trace has no real user IDs; interference
+intensity is an uncalibrated co-tenancy proxy, not a validated slowdown
+model). Run `python3 simulation_demo.py 150 1` for a demo with visible
+contention.
 
 ## H-TAFM: a topology-aware, multi-resource extension (research prototype)
 

@@ -16,6 +16,8 @@ from .cluster import Cluster
 from . import policies
 from . import trace
 from . import experiment
+from . import metrics
+from . import simulation
 
 __all__ = [
     "PodResource",
@@ -27,4 +29,6 @@ __all__ = [
     "policies",
     "trace",
     "experiment",
+    "metrics",
+    "simulation",
 ]

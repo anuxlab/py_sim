@@ -58,6 +58,9 @@ jobs:
       - name: Smoke-test the H-TAFM demo
         run: python3 htafm_demo.py 50
 
+      - name: Smoke-test the time-driven simulation demo
+        run: python3 simulation_demo.py 50 2
+
       - name: Smoke-test the benchmark + plotting pipeline
         run: |
           python3 -c "
