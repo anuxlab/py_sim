@@ -78,7 +78,6 @@ and once green your policy is confirmed compatible and integrated.
 
 1. **lint** — flake8 syntax/undefined-name check (hard fail) + style report
 2. **test** — the full suite (`pytest --cov=k8s_sim`) on Python 3.9–3.12,
-   plus a smoke run of `demo.py` and `trace_demo.py`
    plus a smoke run of `demo.py`, `trace_demo.py`, and a small
    `run_benchmark_suite` + `plotting` call (catches breakage in the
    experiments/analysis pipeline, not just the scoring functions)
