@@ -1,0 +1,22 @@
+[project]
+name = "py_sim"
+version = "1.0.0"
+description = "GPU-cluster scheduling-policy simulator (static and time-driven) with a gputrace bridge"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.23",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+gputrace = ["pandas>=1.5"]  # only needed for load_gputrace_dataframe()
+
+[project.scripts]
+k8s-sim-experiment = "k8s_sim.experiment:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["k8s_sim"]

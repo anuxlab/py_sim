@@ -1,184 +1,83 @@
 """
-A minimal filter -> score -> bind scheduling loop, standing in for the real
-project's simulator.go (which drives the actual k8s scheduler framework
-against a fake API server). This is the piece that's specific to running
-inside Kubernetes in the original; here it's just plain Python.
+``Cluster``: a named collection of nodes plus static (snapshot)
+scheduling. This is the original mode this package was built around —
+schedule a bag of pods against a fixed node set, in submission order, with
+no notion of simulated time. It's the right tool for questions purely
+about packing quality ("does this policy fragment less than that one on
+this exact pod mix").
+
+It is NOT the right tool for questions about arrival dynamics (bursty vs.
+smooth arrivals, queueing delay under load, preemption/eviction over time)
+— for those, use ``event_runtime.EventDrivenRunner`` instead, which wraps
+this same ``Cluster``/``NodeResource`` machinery in a discrete-event time
+loop. See that module's docstring for why the distinction matters.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional
 
-from .policies import htafm_schedule, POLICIES
+import numpy as np
+
+from .fragmentation import cluster_fragmentation_score
+from .policies import get_policy
 from .resource import NodeResource, PodResource
-from .fragmentation import TargetPod, cluster_frag_ratio
-from . import policies as policy_mod
 
 
 @dataclass
 class ScheduleResult:
-    scheduled: List[str] = field(default_factory=list)     # pod names placed
-    unscheduled: List[str] = field(default_factory=list)   # pod names that didn't fit anywhere
-    placement: Dict[str, str] = field(default_factory=dict)  # pod name -> node name
+    pod_id: str
+    node_id: Optional[str]  # None if rejected (no feasible node)
 
 
 class Cluster:
-    def __init__(self, nodes: Sequence[NodeResource]):
-        self.nodes: Dict[str, NodeResource] = {n.name: n.copy() for n in nodes}
-        self._policy_state: Dict[str, dict] = {}  # per-policy persistent scratchpad (e.g. round-robin counter)
+    def __init__(self, nodes: Dict[str, NodeResource]):
+        self.nodes = nodes
+        self._round_robin_state = [0]
 
+    @property
     def node_list(self) -> List[NodeResource]:
         return list(self.nodes.values())
 
-    def feasible_nodes(self, pod: PodResource) -> List[NodeResource]:
-        return [n for n in self.nodes.values() if n.fits(pod)]
-
-    def schedule_pod(self, pod: PodResource, policy: str,
-                      typical_pods: Optional[Sequence[TargetPod]] = None,
-                      affinity_key: Optional[str] = None) -> Optional[str]:
-        """Try to place a single pod. Returns the chosen node name, or None
-        if no node is feasible."""
-        score_fn = policy_mod.POLICIES[policy]
-        candidates = self.feasible_nodes(pod)
-        if not candidates:
+    def schedule_pod(self, pod: PodResource, policy: str = "first_fit",
+                      typical_pods: Optional[List[PodResource]] = None,
+                      rng: Optional[np.random.Generator] = None) -> Optional[str]:
+        """Attempt to place a single pod using the named policy. Returns
+        the chosen node_id, or None if no node had room."""
+        fn = get_policy(policy)
+        chosen = fn(
+            pod, self.node_list,
+            rng=rng, typical_pods=typical_pods,
+            round_robin_state=self._round_robin_state,
+        )
+        if chosen is None:
             return None
+        chosen.add(pod)
+        return chosen.node_id
 
-        ctx: dict = {}
-        if typical_pods is not None:
-            ctx["typical_pods"] = typical_pods
-        if affinity_key is not None:
-            ctx["affinity_key"] = affinity_key
-        ctx["_cluster_state"] = self._policy_state.setdefault(policy, {})
-
-        prepare = policy_mod.PREPARE_HOOKS.get(policy)
-        if prepare:
-            prepare(candidates, pod, ctx)
-
-        best_node, best_score = None, None
-        for node in candidates:
-            s = score_fn(node, pod, ctx)
-            if best_score is None or s > best_score:
-                best_node, best_score = node, s
-
-        chosen = self.nodes[best_node.name]
-        self.nodes[best_node.name] = chosen.sub(pod)
-
-        # bookkeeping for gpu-clustering's affinity map
-        if pod.gpu_number > 0:
-            key = affinity_key or pod.gpu_type or "default"
-            self.nodes[best_node.name].gpu_affinity[key] = \
-                self.nodes[best_node.name].gpu_affinity.get(key, 0) + 1
-
-        return best_node.name
-
-    def schedule_pod_tracked(self, pod: PodResource, policy: str,
-                              typical_pods: Optional[Sequence[TargetPod]] = None,
-                              affinity_key: Optional[str] = None) -> Optional["tuple[str, List[int]]"]:
-        """Same decision logic as schedule_pod, but also returns exactly
-        which GPU device indices were used, so a caller (k8s_sim.simulation)
-        can release precisely those devices later via release_pod() --
-        needed once pods can depart independently of arrival order, which
-        schedule_pod's plain node.sub() doesn't support (see
-        NodeResource.sub_with_gpu_ids's docstring)."""
-        score_fn = policy_mod.POLICIES[policy]
-        candidates = self.feasible_nodes(pod)
-        if not candidates:
-            return None
-
-        ctx: dict = {}
-        if typical_pods is not None:
-            ctx["typical_pods"] = typical_pods
-        if affinity_key is not None:
-            ctx["affinity_key"] = affinity_key
-        ctx["_cluster_state"] = self._policy_state.setdefault(policy, {})
-
-        prepare = policy_mod.PREPARE_HOOKS.get(policy)
-        if prepare:
-            prepare(candidates, pod, ctx)
-
-        best_node, best_score = None, None
-        for node in candidates:
-            s = score_fn(node, pod, ctx)
-            if best_score is None or s > best_score:
-                best_node, best_score = node, s
-
-        chosen = self.nodes[best_node.name]
-        new_node, gpu_ids = chosen.sub_with_gpu_ids(pod)
-        self.nodes[best_node.name] = new_node
-
-        if pod.gpu_number > 0:
-            key = affinity_key or pod.gpu_type or "default"
-            self.nodes[best_node.name].gpu_affinity[key] = \
-                self.nodes[best_node.name].gpu_affinity.get(key, 0) + 1
-
-        return best_node.name, gpu_ids
-
-    def release_pod(self, pod: PodResource, node_name: str, gpu_ids: Sequence[int]) -> None:
-        """Release a previously-placed pod's resources back onto the named
-        node, using the SAME gpu_ids schedule_pod_tracked recorded for it."""
-        self.nodes[node_name] = self.nodes[node_name].add(pod, gpu_ids=list(gpu_ids))
-
-    def schedule_pods(self, pods: Sequence[PodResource], policy: str, typical_pods: Optional[Sequence[TargetPod]] = None) -> ScheduleResult:
+    def schedule_pods(self, pods: List[PodResource], policy: str = "first_fit",
+                       typical_pods: Optional[List[PodResource]] = None,
+                       seed: int = 0) -> List[ScheduleResult]:
+        """Static batch scheduling: place every pod in ``pods``, in list
+        order, against the cluster's current state. Does not model time —
+        pods are never released. Use a fresh ``Cluster`` (or
+        ``reset_cluster``, see trace.py) per run if you want to compare
+        policies on identical starting conditions.
         """
-        Schedule a batch of pods. For the HTAFM policy, we use the batch scheduler.
-        For all other policies, we schedule pods one at a time in the given order.
-        """
-        # ----- HTAFM batch scheduling -----
-        if policy == "htafm":
-            # Call the HTAFM batch scheduler
-            result = htafm_schedule(self.node_list(), list(pods), typical_pods)
-            # Apply the placements to the cluster
-            scheduled_names = []
-            unscheduled_names = list(result.unscheduled)
-            placement_map = {}
-            for pod_name, node_name in result.scheduled:
-                # Find the pod object
-                pod_obj = next((p for p in pods if p.name == pod_name), None)
-                if pod_obj is None:
-                    continue
-                # Find the node and apply resources
-                node_obj = self.nodes.get(node_name)
-                if node_obj is not None:
-                    # Apply the pod to the node (deduct resources)
-                    self.nodes[node_name] = node_obj.sub(pod_obj)
-                    scheduled_names.append(pod_name)
-                    placement_map[pod_name] = node_name
-                else:
-                    # Node not found -> treat as unscheduled
-                    unscheduled_names.append(pod_name)
-            # Remove duplicates from unscheduled
-            unscheduled_names = list(set(unscheduled_names))
-            return ScheduleResult(
-                scheduled=scheduled_names,
-                unscheduled=unscheduled_names,
-                placement=placement_map
-            )
-
-        # ----- Standard per‑pod scheduling for other policies -----
-        result = ScheduleResult()
+        rng = np.random.default_rng(seed)
+        results = []
         for pod in pods:
-            node_name = self.schedule_pod(pod, policy, typical_pods=typical_pods)
-            pod_id = pod.name or pod.repr()
-            if node_name is None:
-                result.unscheduled.append(pod_id)
-            else:
-                result.scheduled.append(pod_id)
-                result.placement[pod_id] = node_name
-        return result
+            node_id = self.schedule_pod(pod, policy=policy, typical_pods=typical_pods, rng=rng)
+            results.append(ScheduleResult(pod_id=pod.pod_id, node_id=node_id))
+        return results
 
-    def fragmentation_ratio(self, typical_pods: Sequence[TargetPod]) -> float:
-        """Cluster-wide fraction of idle GPU memory that's fragmented (lower
-        is better). Mirrors plugin.PreFilterFragGpuRatio."""
-        return cluster_frag_ratio(self.node_list(), typical_pods)
+    def fragmentation_score(self, typical_pods: List[PodResource]) -> float:
+        return cluster_fragmentation_score(self.node_list, typical_pods)
 
-    def utilization(self) -> Dict[str, float]:
-        """Simple headline stats: fraction of CPU / GPU capacity in use."""
-        cpu_cap = sum(n.milli_cpu_capacity for n in self.nodes.values())
-        cpu_left = sum(n.milli_cpu_left for n in self.nodes.values())
-        gpu_cap = sum(n.gpu_number for n in self.nodes.values()) * 1000
-        gpu_left = sum(n.total_milli_gpu_left() for n in self.nodes.values())
-        return {
-            "cpu_utilization": 1 - cpu_left / cpu_cap if cpu_cap else 0.0,
-            "gpu_utilization": 1 - gpu_left / gpu_cap if gpu_cap else 0.0,
-        }
+    def total_gpu_utilization(self) -> float:
+        total_cap = sum(n.milli_gpu_capacity for n in self.node_list)
+        if total_cap == 0:
+            return 0.0
+        total_used = sum(n.milli_gpu_capacity - n.remaining_milli_gpu for n in self.node_list)
+        return total_used / total_cap

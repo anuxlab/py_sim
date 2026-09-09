@@ -1,131 +1,73 @@
 """
-Port of pkg/utils/frag.go — the fragmentation model behind the FGD
-(Fragmentation Gradient Descent) policy from the USENIX ATC'23 paper
-"Beware of Fragmentation".
+Fragmentation scoring, in the spirit of Alibaba's Fragmentation Gradient
+Descent (FGD) approach: rather than scoring a node's leftover capacity in
+the abstract, score it by how many *representative pod shapes actually
+seen in this workload* could still be placed in what's left. Resources
+left over that can't fit ANY typical shape are fragmented in the sense
+that actually matters — they can't be used by the workload you have,
+regardless of how large the raw number looks.
 
-For a node and a hypothetical ("typical") pod spec, the node is classified
-into one of 7 buckets depending on whether the node currently has enough
-free CPU / GPU-memory to satisfy that pod:
-
-    Q1_LACK_BOTH   - not enough CPU AND not enough GPU
-    Q2_LACK_GPU    - enough CPU, not enough GPU
-    Q3_SATISFIED   - enough CPU AND enough GPU (good fit)
-    Q4_LACK_CPU    - enough GPU, not enough CPU
-    XL_SATISFIED   - pod wants no GPU, node has enough CPU
-    XR_LACK_CPU    - pod wants no GPU, node lacks CPU
-    NO_ACCESS      - GPU type mismatch
-
-All buckets except Q3_SATISFIED are considered "fragmented" idle GPU memory:
-capacity that is sitting idle but can't actually be used by a representative
-pod shape. FGD scores a placement by how much it reduces this fragmented
-amount, summed across a distribution of "typical" pod shapes.
+``build_typical_pods`` derives that representative shape set directly from
+a pod list (real, loaded, or gputrace-generated) rather than a fixed
+hardcoded set of sizes, so fragmentation scoring is always relative to the
+workload actually being scheduled.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Sequence
+from typing import List
+
+import numpy as np
 
 from .resource import NodeResource, PodResource
 
-Q1_LACK_BOTH = "q1_lack_both"
-Q2_LACK_GPU = "q2_lack_gpu"
-Q3_SATISFIED = "q3_satisfied"
-Q4_LACK_CPU = "q4_lack_cpu"
-XL_SATISFIED = "xl_satisfied"
-XR_LACK_CPU = "xr_lack_cpu"
-NO_ACCESS = "no_access"
 
-FRAG_TYPES = [Q1_LACK_BOTH, Q2_LACK_GPU, Q3_SATISFIED, Q4_LACK_CPU,
-              XL_SATISFIED, XR_LACK_CPU, NO_ACCESS]
-
-
-@dataclass
-class TargetPod:
-    """A representative pod shape and how frequently it occurs in the
-    workload (0.0-1.0). Mirrors simontype.TargetPod."""
-
-    pod: PodResource
-    percentage: float
-
-
-def get_gpu_frag_milli(node: NodeResource, pod: PodResource) -> int:
-    """Sum of milli-gpu on GPUs that are individually too small for `pod`."""
-    return sum(left for left in node.milli_gpu_left_list if left < pod.milli_gpu)
-
-
-def get_node_pod_frag(node: NodeResource, pod: PodResource) -> str:
-    """Classify (node, pod) into one of the 7 fragmentation buckets.
-    Mirrors utils.GetNodePodFrag."""
-    if pod.milli_gpu == 0 and pod.gpu_number == 0:
-        return XL_SATISFIED if node.milli_cpu_left >= pod.milli_cpu else XR_LACK_CPU
-
-    if not node.is_accessible_to(pod):
-        return NO_ACCESS
-
-    if node.can_host_on_gpu_memory(pod):
-        return Q3_SATISFIED if node.milli_cpu_left >= pod.milli_cpu else Q4_LACK_CPU
-    else:
-        return Q2_LACK_GPU if node.milli_cpu_left >= pod.milli_cpu else Q1_LACK_BOTH
-
-
-def node_gpu_share_frag_amount(node: NodeResource, typical_pods: Sequence[TargetPod]) -> Dict[str, float]:
-    """The expected *amount* (in milli-gpu) of fragmented capacity on this
-    node, broken down by bucket, averaged over the typical-pod distribution.
-    Mirrors utils.NodeGpuShareFragAmount.
-
-    Special case for Q3 (satisfied): only the portion of idle GPU-memory that
-    sits on devices too small to fit the pod is "wasted"; the rest is
-    genuinely usable, so it's still counted as Q3 (not fragmented).
+def build_typical_pods(pods: List[PodResource], n_quantiles: int = 5) -> List[PodResource]:
+    """Derive a small representative set of pod shapes from a pod list, by
+    binning GPU-requesting pods' (milli_cpu, milli_gpu, gpu_number) into
+    quantiles. Falls back to a couple of fixed CPU-only shapes if the
+    workload has no GPU pods at all.
     """
-    amount = {t: 0.0 for t in FRAG_TYPES}
-    gpu_milli_left_total = node.total_milli_gpu_left()
+    gpu_pods = [p for p in pods if p.gpu_number > 0 or p.milli_gpu > 0]
+    if not gpu_pods:
+        cpu_vals = sorted(p.milli_cpu for p in pods) or [1000]
+        qs = np.quantile(cpu_vals, np.linspace(0.2, 0.8, n_quantiles))
+        return [PodResource(pod_id=f"typical_{i}", milli_cpu=int(q)) for i, q in enumerate(qs)]
 
-    for tp in typical_pods:
-        freq = tp.percentage
-        if not (0.0 <= freq <= 1.0):
-            continue
-        frag_type = get_node_pod_frag(node, tp.pod)
-        if frag_type == Q3_SATISFIED:
-            gpu_frag_milli = get_gpu_frag_milli(node, tp.pod)
-            amount[Q2_LACK_GPU] += freq * gpu_frag_milli
-            amount[Q3_SATISFIED] += freq * (gpu_milli_left_total - gpu_frag_milli)
-        else:
-            amount[frag_type] += freq * gpu_milli_left_total
-    return amount
+    cpu = np.array([p.milli_cpu for p in gpu_pods])
+    gpu_milli = np.array([p.milli_gpu if p.milli_gpu else p.gpu_number * 1000 for p in gpu_pods])
+    gpu_n = np.array([max(p.gpu_number, 1) for p in gpu_pods])
 
-
-def frag_amount_sum_except_q3(amount: Dict[str, float]) -> float:
-    return sum(v for k, v in amount.items() if k != Q3_SATISFIED)
-
-
-def node_gpu_share_frag_amount_score(node: NodeResource, typical_pods: Sequence[TargetPod]) -> float:
-    """The scalar fragmentation score for a node: total fragmented milli-gpu,
-    summed over all buckets except Q3 (satisfied/usable). Lower is better.
-    Mirrors utils.NodeGpuShareFragAmountScore."""
-    return frag_amount_sum_except_q3(node_gpu_share_frag_amount(node, typical_pods))
+    qs = np.linspace(0.1, 0.9, n_quantiles)
+    typical = []
+    for i, q in enumerate(qs):
+        typical.append(
+            PodResource(
+                pod_id=f"typical_{i}",
+                milli_cpu=int(np.quantile(cpu, q)),
+                milli_gpu=int(np.quantile(gpu_milli, q)),
+                gpu_number=int(round(np.quantile(gpu_n, q))),
+            )
+        )
+    return typical
 
 
-def cluster_frag_ratio(nodes: Sequence[NodeResource], typical_pods: Sequence[TargetPod]) -> float:
-    """Fraction of all idle GPU-memory across the cluster that is fragmented.
-    Mirrors plugin.PreFilterFragGpuRatio. Handy top-line metric for comparing
-    policies."""
-    total_frag = 0.0
-    total_idle = 0.0
-    for node in nodes:
-        amount = node_gpu_share_frag_amount(node, typical_pods)
-        total_frag += frag_amount_sum_except_q3(amount)
-        total_idle += sum(amount.values())
-    if total_idle == 0:
+def unfit_fraction(node: NodeResource, typical_pods: List[PodResource]) -> float:
+    """Fraction of ``typical_pods`` that could NOT be placed in ``node``'s
+    *current remaining* capacity. 0.0 = no fragmentation (everything
+    representative still fits); 1.0 = fully fragmented (nothing
+    representative fits, even though raw numbers may be nonzero)."""
+    if not typical_pods:
         return 0.0
-    return total_frag / total_idle
+    cannot_fit = sum(1 for p in typical_pods if not p.fits_in(node))
+    return cannot_fit / len(typical_pods)
 
 
-def build_typical_pods_uniform(pod_shapes: Sequence[PodResource]) -> List[TargetPod]:
-    """Convenience helper: build a TargetPod distribution that weights each
-    given pod shape equally. For frequency-weighted construction from a real
-    workload trace, replicate GetTypicalPods from frag.go instead."""
-    if not pod_shapes:
-        return []
-    w = 1.0 / len(pod_shapes)
-    return [TargetPod(pod=p, percentage=w) for p in pod_shapes]
+def cluster_fragmentation_score(nodes: List[NodeResource], typical_pods: List[PodResource]) -> float:
+    """Mean unfit-fraction across all nodes with nonzero remaining GPU
+    capacity (fully-empty and fully-packed nodes both contribute — empty
+    nodes at 0.0, full nodes near 1.0 automatically)."""
+    if not nodes:
+        return 0.0
+    scores = [unfit_fraction(n, typical_pods) for n in nodes]
+    return float(np.mean(scores))

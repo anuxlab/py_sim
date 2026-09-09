@@ -1,34 +1,43 @@
 """
-k8s_sim - a standalone Python re-implementation of the core scheduling logic
-from hkust-adsl/kubernetes-scheduler-simulator ("Simon").
+k8s_sim: a GPU-cluster scheduling-policy simulator, with two modes.
 
-This package ports the resource model, fragmentation math, and the six
-scoring policies (Random, Best-Fit, Dot-Product/Tetris, GPU-Packing,
-GPU-Clustering, FGD) out of the original Go + real-k8s-scheduler-framework
-code into plain, dependency-free Python so they can be run and experimented
-with outside of Kubernetes entirely. See README.md for details and for the
-simplifications made relative to the original.
+Static / snapshot mode (the original design): schedule a fixed bag of pods
+against a fixed node set, no notion of time. Good for pure packing-quality
+questions.
+
+    from k8s_sim import Cluster, load_nodes_csv, load_pods_csv, build_typical_pods
+    nodes = load_nodes_csv("nodes.csv")
+    pods = load_pods_csv("pods.csv")
+    cluster = Cluster(nodes)
+    results = cluster.schedule_pods(pods, policy="fgd", typical_pods=build_typical_pods(pods))
+    print(cluster.fragmentation_score(build_typical_pods(pods)))
+
+Time-driven / event mode (new — see event_runtime.py's docstring for why
+this exists): schedule a gputrace-derived arrival trace over simulated
+time, with queueing and release-on-completion.
+
+    from k8s_sim import Cluster, load_gputrace_export, EventDrivenRunner, RunConfig, build_typical_pods
+    nodes, events = load_gputrace_export("pods.csv", "nodes.csv")
+    cluster = Cluster(nodes)
+    runner = EventDrivenRunner(cluster, RunConfig(policy="fgd"))
+    result = runner.run(events, typical_pods=build_typical_pods([e.pod for e in events]))
+    print(result.rejection_rate, result.mean_wait_time, result.p95_wait_time)
 """
 
-from .resource import PodResource, NodeResource
-from .fragmentation import TargetPod, node_gpu_share_frag_amount_score, get_node_pod_frag
-from .cluster import Cluster
-from . import policies
-from . import trace
-from . import experiment
-from . import metrics
-from . import simulation
+from .resource import NodeResource, PodResource
+from .fragmentation import build_typical_pods, unfit_fraction, cluster_fragmentation_score
+from .policies import POLICIES, get_policy, list_policies
+from .cluster import Cluster, ScheduleResult
+from .trace import load_nodes_csv, load_pods_csv, reset_cluster
+from .gputrace_bridge import TimedPodEvent, load_gputrace_export, load_gputrace_dataframe
+from .event_runtime import EventDrivenRunner, RunConfig, RunResult, PodOutcome
 
 __all__ = [
-    "PodResource",
-    "NodeResource",
-    "TargetPod",
-    "node_gpu_share_frag_amount_score",
-    "get_node_pod_frag",
-    "Cluster",
-    "policies",
-    "trace",
-    "experiment",
-    "metrics",
-    "simulation",
+    "NodeResource", "PodResource",
+    "build_typical_pods", "unfit_fraction", "cluster_fragmentation_score",
+    "POLICIES", "get_policy", "list_policies",
+    "Cluster", "ScheduleResult",
+    "load_nodes_csv", "load_pods_csv", "reset_cluster",
+    "TimedPodEvent", "load_gputrace_export", "load_gputrace_dataframe",
+    "EventDrivenRunner", "RunConfig", "RunResult", "PodOutcome",
 ]

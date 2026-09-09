@@ -1,251 +1,218 @@
-# k8s_sim — standalone Python port of `kubernetes-scheduler-simulator`
+# py_sim / k8s_sim
 
-This is a dependency-free Python re-implementation of the **core scheduling
-logic** from [hkust-adsl/kubernetes-scheduler-simulator](https://github.com/hkust-adsl/kubernetes-scheduler-simulator)
-("Simon"), the simulator behind the USENIX ATC'23 paper *"Beware of
-Fragmentation: Scheduling GPU-Sharing Workloads with Fragmentation Gradient
-Descent"*, **plus 5 additional benchmark baselines from the scheduling
-literature**, a CI-enforced compatibility contract for adding new policies,
-the original's real production trace data, and a benchmark/analysis/plotting
-pipeline.
+A GPU-cluster scheduling-policy simulator, in two modes:
 
-The original is a Go program that drives the **real Kubernetes scheduler
-framework** against a fake API server (built on Alibaba's open-simulator).
-That's the right design for validating against real k8s manifests and
-traces, but it means you need Go, `k8s.io/kubernetes` internals, and a vendor
-tree just to experiment with the scheduling math. This port strips all of
-that away and keeps just the parts that actually decide *where a pod goes*:
-the resource model, the fragmentation math, and the scoring policies — so
-they can run anywhere Python runs, be unit-tested trivially, or be embedded
-in a notebook.
+* **static / snapshot** — schedule a fixed bag of pods against a fixed
+  node set, no notion of time. Good for pure packing-quality comparisons.
+* **time-driven / event-based** *(new)* — schedule a trace with real
+  arrival times and durations over simulated time, with queueing and
+  release-on-completion. This is what actually lets arrival-dynamics
+  differences (bursty vs. smooth, flash crowds, diurnal cycles) show up in
+  the results at all — see "Why two modes" below.
 
-## Files
+Built to plug directly into [`gputrace`](../gputrace)'s synthetic
+workload scenarios, via `k8s_sim/gputrace_bridge.py`.
 
-| File | Ported from | Contents |
-|---|---|---|
-| `k8s_sim/resource.py` | `pkg/type/resource.go` | `PodResource` / `NodeResource`, fit-checking, `Sub`/`Add` allocation |
-| `k8s_sim/fragmentation.py` | `pkg/utils/frag.go` | The Q1–Q4/XL/XR/NoAccess fragmentation classification and amount calculation used by FGD |
-| `k8s_sim/policies.py` | `pkg/simulator/plugin/*.go` + literature | The original's 6 scoring plugins (Random, Best-Fit, Dot-Product/Tetris, GPU-Packing, GPU-Clustering, FGD) plus 5 new baselines (First-Fit, Worst-Fit, Round-Robin, DRF, Least-Requested) — see "Benchmark algorithms" below |
-| `k8s_sim/cluster.py` | `pkg/simulator/simulator.go` (partial) | The filter → score → bind scheduling loop, with a per-policy persistent scratchpad for stateful policies like Round-Robin |
-| `k8s_sim/trace.py` | `data/pod_csv_to_yaml.py`, `pkg/utils/frag.go`'s `GetTypicalPods` | Loader for the real production CSV traces in `data/csv/`, plus typical-pod-distribution derivation |
-| `k8s_sim/experiment.py` | `scripts/analysis.py`, `experiments/analysis/*.py` | Benchmark-suite driver: sweeps policies x workloads x scale x seed, writes tidy CSVs |
-| `k8s_sim/plotting.py` | `experiments/plot/*.py` | Matplotlib charts (frag ratio, frag breakdown, alloc-by-category, frag-vs-scale) from those CSVs |
-| `data/csv/*.csv` | `data/csv/*.csv` (verbatim) | The original repo's real trace data: 1523 nodes / 8152 pods from a production GPU cluster, plus 20+ resampled workload-mix variants |
-| `demo.py` | `example/` + `experiments/` | Compare all registered policies on a synthetic GPU-sharing workload |
-| `trace_demo.py` | `experiments/` | Compare all registered policies on the **real** production trace data |
-| `experiments/` | `experiments/` | Results storage, deep analysis, and plots — see `experiments/README.md` |
-| `k8s_sim/simulation.py`, `k8s_sim/metrics.py` | — (new) | Time-driven simulation + 7 performance metrics — see `docs/METRICS.md` |
-| `simulation_demo.py` | — (new) | Compare policies on utilization/throughput/waiting/fairness/starvation/latency/interference |
-| `k8s_sim/topology.py`, `k8s_sim/htafm.py` | — (new, research prototype) | H-TAFM: topology-aware, multi-resource fragmentation metric + scheduler — see `docs/HTAFM.md` |
-| `htafm_demo.py` | — (new) | Compare H-TAFM's 3 variants against FGD/Best-Fit/Random |
-| `tests/` | — (new) | Conformance + integration test suite; see "CI / adding a new policy" below |
-| `.github/workflows/ci.yml` | — (new) | GitHub Actions pipeline that runs the test suite on every push/PR |
+## Install
+
+```bash
+pip install -e .
+# or, to use load_gputrace_dataframe() directly on a pandas DataFrame:
+pip install -e ".[gputrace]"
+```
+
+Requires Python 3.10+, numpy (pandas only if using the DataFrame bridge).
+
+## Why two modes (read this first)
+
+The original design here was snapshot-only: `Cluster.schedule_pods()`
+places a list of pods in order and never releases anything. That's fine
+for asking "does policy X pack tighter than policy Y on this pod mix" —
+but it cannot express *when* jobs arrive or *when* they finish, so it
+cannot distinguish a workload with smooth arrivals from one with the exact
+same jobs arriving in violent bursts. Every gputrace scenario that's
+about arrival dynamics rather than job-size mix — `bursty_arrivals`,
+`diurnal_pattern`, `flash_crowd`, `cold_start_storm`, `spot_preemption_churn`
+— would collapse into indistinguishable input under snapshot scheduling.
+
+`event_runtime.EventDrivenRunner` fixes this: a real discrete-event loop
+over `(submit_time, duration)`, with a FIFO pending queue and
+release-on-completion. Proof it matters — from this repo's own test suite:
+
+```python
+# 40 identical jobs, same span, same average rate.
+# "smooth": one every ~1 time unit.
+# "bursty": all 40 arrive in two waves of 20.
+# Same cluster, same policy — only the arrival *pattern* differs.
+assert r_bursty.rejection_rate > r_smooth.rejection_rate
+```
+
+and empirically, running actual gputrace scenarios through both:
+
+```
+bursty_arrivals  fgd   reject=0.165  mean_wait=911.1   <- real congestion, visible
+baseline         fgd   reject=0.000  mean_wait=2719.7   <- same avg rate, no bursts
+```
+
+Static mode literally cannot produce this distinction — it has no
+concept of "before" or "after."
 
 ## Quickstart
 
-```bash
-python3 demo.py
-```
-
 ```python
-from k8s_sim import Cluster, NodeResource, PodResource
+from k8s_sim import (
+    Cluster, RunConfig, EventDrivenRunner, build_typical_pods,
+    load_gputrace_export,
+)
 
-cluster = Cluster([
-    NodeResource(name="node-0", milli_cpu_left=32000, milli_cpu_capacity=32000,
-                 milli_gpu_left_list=[1000, 1000, 1000, 1000], gpu_type="V100"),
-])
-pod = PodResource(milli_cpu=2000, milli_gpu=500, gpu_number=1, gpu_type="V100")
-node_name = cluster.schedule_pod(pod, policy="fgd", typical_pods=[...])
-```
-
-### Using the real production trace data
-
-```bash
-python3 trace_demo.py openb_pod_list_gpushare100.csv 400
-```
-
-```python
-from k8s_sim import Cluster
-from k8s_sim.trace import load_nodes_csv, load_pods_csv, build_typical_pods
-
-nodes = load_nodes_csv()                                       # all 1523 nodes
-trace_pods = load_pods_csv(limit=1000, sample=True, seed=0)     # random 1000-pod subset
-typical = build_typical_pods(trace_pods)                        # weighted typical-pod distribution
-
+nodes, events = load_gputrace_export("traces/bursty_arrivals/pods.csv",
+                                      "traces/bursty_arrivals/nodes.csv")
 cluster = Cluster(nodes)
-result = cluster.schedule_pods([tp.pod for tp in trace_pods], "fgd", typical_pods=typical)
-print(len(result.scheduled), "scheduled,", len(result.unscheduled), "unscheduled")
+typical = build_typical_pods([e.pod for e in events])
+
+runner = EventDrivenRunner(cluster, RunConfig(policy="fgd", max_queue_time=None))
+result = runner.run(events, typical_pods=typical)
+
+print(result.rejection_rate, result.mean_wait_time, result.p95_wait_time, result.makespan)
 ```
 
-`data/csv/` has 20+ pre-sampled trace variants (`openb_pod_list_cpu*.csv`,
-`*_gpushare*.csv`, `*_multigpu*.csv`, `*_gpuspec*.csv`) emphasizing different
-workload mixes — see `data/ORIGINAL_DATA_README.md` (copied verbatim from the
-original repo's `data/README.md`) for the column definitions and what each
-variant emphasizes. Use `load_pods_csv(path=..., sample=True)` to point at
-any of them; `sample=True` draws a uniform random subset across the whole
-file rather than a chronological prefix, since GPU-requesting pods are
-concentrated later in some of the trace files.
+Static/snapshot mode, if that's genuinely what you want to measure:
 
-## Benchmark algorithms
+```python
+from k8s_sim import Cluster, load_nodes_csv, load_pods_csv, build_typical_pods
 
-`k8s_sim.policies.POLICIES` currently registers 11 scoring policies:
+nodes = load_nodes_csv("nodes.csv")
+pods = load_pods_csv("pods.csv")
+typical = build_typical_pods(pods)
+cluster = Cluster(nodes)
+results = cluster.schedule_pods(pods, policy="fgd", typical_pods=typical)
+print(cluster.fragmentation_score(typical))
+```
 
-| Policy | Family | Reference |
-|---|---|---|
-| `random` | spreading | — (original repo's naive baseline) |
-| `first-fit` | packing | Johnson, "Fast Algorithms for Bin Packing," *J. Comput. Syst. Sci.* 8(3), 1974 |
-| `worst-fit` | spreading | Coffman, Garey, Johnson, "Approximation Algorithms for Bin Packing: A Survey," 1996 |
-| `round-robin` | spreading | classic scheduling baseline; used e.g. in Grandl et al., "Tetris," SIGCOMM 2014 |
-| `best-fit` | packing | original repo (`pkg/simulator/plugin/best_fit_score.go`) |
-| `dot-product` | packing | original repo, Tetris-style alignment scoring (`dot_product_score.go`) |
-| `drf` | spreading | Ghodsi, Zaharia, Hindman, Konwinski, Shenker, Stoica, "Dominant Resource Fairness," NSDI 2011 |
-| `least-requested` | spreading | Kubernetes `NodeResourcesFit` LeastAllocated strategy (kube-scheduler docs) |
-| `gpu-packing` | packing | original repo, consolidates onto already-shared GPUs (`gpu_packing_score.go`) |
-| `gpu-clustering` | packing | original repo, affinity-tag co-location (`gpu_clustering_score.go`) |
-| `fgd` | packing | Weng et al., "Beware of Fragmentation: Scheduling GPU-Sharing Workloads with Fragmentation Gradient Descent," USENIX ATC 2023 |
+### End-to-end with gputrace, in one process
 
-The 5 new baselines (first-fit, worst-fit, round-robin, drf,
-least-requested) exist so FGD and the original's other packing-aware
-policies have a wider, better-known set of reference points to benchmark
-against — classic bin-packing heuristics (First-Fit / Worst-Fit), a
-fairness-theoretic baseline (DRF), a production-scheduler baseline
-(Kubernetes' own default strategy), and a structural baseline (Round-Robin).
-Across every workload category in the benchmark suite, the packing-family
-policies consistently produce lower GPU fragmentation than the
-spreading-family ones, and `fgd` comes out lowest of all — see
-`experiments/plots/expected_results/` for example charts.
+```python
+import gputrace as gt
+from k8s_sim import Cluster, RunConfig, EventDrivenRunner, build_typical_pods
+from k8s_sim.gputrace_bridge import load_gputrace_dataframe
 
-Each policy's docstring in `k8s_sim/policies.py` carries its citation.
-`round-robin` needed one addition to the architecture: it's the first
-policy that needs state to *persist across* pod placements (which node got
-the last pod), so `Cluster` now keeps a small per-policy scratchpad
-(`Cluster._policy_state`) that survives across `schedule_pod` calls within
-the same `Cluster` instance.
+fit = gt.analyze_file("alibaba2020", "pai_task_table_sample.csv")
+df = gt.generate("bursty_arrivals", fit, n_jobs=20_000, seed=1)
 
-## Experiments: results, deep analysis, and plots
+nodes, events = load_gputrace_dataframe(df, n_nodes=30, gpus_per_node=8)
+cluster = Cluster(nodes)
+result = EventDrivenRunner(cluster, RunConfig(policy="fgd")).run(
+    events, typical_pods=build_typical_pods([e.pod for e in events])
+)
+```
 
-See **`experiments/README.md`** for the full guide. In short:
+## The benchmark sweep
 
 ```bash
-pip install -r requirements-analysis.txt
-python3 experiments/run_benchmark.py --preset fast
+# generate + export every scenario first (from the gputrace side):
+gputrace generate-all --fit fit.json --n-jobs 20000 --seed 1 --out-dir /tmp/raw/
+for f in /tmp/raw/*.csv; do
+  name=$(basename "$f" .csv)
+  gputrace export --input "$f" --format k8s_sim --out-dir "traces/$name" --n-nodes 20 --gpus-per-node 8
+done
+
+# then sweep every policy x scenario x seed x scale:
+python -m k8s_sim.experiment --traces-dir traces/ \
+    --policies fgd,best_fit,worst_fit,first_fit,random,gpu_packing,least_requested,round_robin \
+    --seeds 1,2,3,4,5 --scale 0.5,1.0,2.0 --mode time-driven --out results.csv
 ```
 
-sweeps all 11 policies across 5 curated workload categories, writes a tidy
-CSV to `experiments/results/`, and generates 3 plots to `experiments/plots/`
-(fragmentation ratio by policy, the Q1-Q4/XL/XR/NoAccess breakdown, and
-allocation ratio by workload category). Add `--preset scale` to also sweep
-pod count and get a fragmentation-vs-load line chart. This is the Python
-equivalent of the original's `experiments/run_scripts` → `scripts/analysis.py`
-→ `experiments/analysis/merge_*.py` → `experiments/plot/plot_*.py` pipeline,
-collapsed into one script since there's no Go binary or log-scraping step.
+`results.csv` is tidy — one row per (scenario, policy, scale, seed) — with
+`rejection_rate`, `mean_wait_time`, `p95_wait_time`, `makespan`,
+`final_fragmentation_score`, `final_gpu_utilization`. `--scale` subsamples
+(< 1.0) or duplicates-with-jitter (> 1.0) the event list to sweep
+contention level without regenerating traces.
 
-## Performance metrics system: utilization, throughput, waiting time, fairness, starvation, latency, interference
+Add `--mode static` to instead run the original snapshot-only comparison
+(no queueing/release modeled) — useful as a contrast, not a replacement.
 
-`k8s_sim/simulation.py` + `k8s_sim/metrics.py` add a **time-driven**
-simulation mode (discrete-event: arrivals, a FIFO pending queue, departures
-that release resources) on top of the static one-shot batch mode everything
-else uses — this is what makes cluster utilization *over time*, job
-throughput, waiting time, fairness, starvation, scheduling latency, and
-interference intensity computable at all. **See `docs/METRICS.md`** for the
-full writeup, including a correctness fix this required (tracking exactly
-which GPU devices a pod used so departures release the right capacity) and
-honest caveats on the two metrics that needed something invented (fairness
-needs synthetic tenants — the trace has no real user IDs; interference
-intensity is an uncalibrated co-tenancy proxy, not a validated slowdown
-model). Run `python3 simulation_demo.py 150 1` for a demo with visible
-contention.
+## Scheduling policies
 
-## H-TAFM: a topology-aware, multi-resource extension (research prototype)
+`k8s_sim.list_policies()`: `random`, `first_fit`, `best_fit`, `worst_fit`,
+`round_robin`, `gpu_packing`, `least_requested`, `fgd`
+(fragmentation-gradient-descent — greedily minimizes the *increase* in
+fragmentation score, not just raw leftover capacity; see
+`policies.py`/`fragmentation.py` docstrings). Add a new one by writing a
+function matching the signature documented in `policies.py` and adding it
+to the `POLICIES` dict.
 
-`k8s_sim/topology.py` + `k8s_sim/htafm.py` implement H-TAFM (Hypergraph-based
-Topology-Aware Fragmentation Metric) — a proposed extension of FGD to
-CPU+Memory+GPU and a synthetic NUMA/Socket/Server/Rack hierarchy, scored via
-a weighted hypergraph and a gradient-descent scheduler analogous to FGD's.
-It operates at NUMA-vertex granularity (finer than the rest of this repo's
-whole-node placement), so it's its own module rather than another
-`policies.POLICIES` entry. **See `docs/HTAFM.md`** for the full
-methodology-to-code mapping, documented simplifications, and two concrete
-findings from testing it against the real trace data: TAFI-Entropy violates
-its own claimed monotonicity property (TAFI-Cut and TAFI-Hier don't), and
-NUMA-granularity placement can reject large multi-GPU jobs that
-node-granularity placement accepts. Run `python3 htafm_demo.py 300` to
-compare all 3 variants against FGD/Best-Fit/Random on real trace data.
+## Fragmentation scoring
 
-## What's ported faithfully
+Rather than scoring leftover capacity in the abstract, `fragmentation.py`
+scores it by how many *representative pod shapes actually present in this
+workload* (`build_typical_pods`, derived from quantile-binning the real
+pod list) could still fit in what's left. Leftover resources that can't
+fit any typical shape are fragmented in the sense that matters, regardless
+of how large the raw numbers look.
 
-- **Resource units**: milli-cpu and per-device milli-gpu (0–1000), identical
-  to the original's GPU-sharing model.
-- **Fragmentation classification** (`get_node_pod_frag`): the exact
-  Q1/Q2/Q3/Q4/XL/XR/NoAccess bucket logic from `frag.go`, including the Q3
-  special-case where only the *undersized-device* portion of "satisfied"
-  idle GPU memory counts as waste.
-- **All 6 scoring formulas**: Best-Fit's weighted normalized-leftover score,
-  GPU-Packing's 3-tier consolidation scoring, GPU-Clustering's affinity
-  tiers, and FGD's sigmoid-of-fragmentation-delta — all translated line by
-  line from the corresponding `*_score.go` file.
-- **GPU packing within a node** (`NodeResource.sub`): ascending
-  least-sufficient-device-first, matching `simontype.NodeResource.Sub`.
+## The gputrace bridge
 
-## Simplifications relative to the original
+`k8s_sim/gputrace_bridge.py` is the concrete integration point:
 
-These were dropped because they're either Kubernetes-specific plumbing with
-no bearing on the scheduling *decision*, or configuration knobs whose
-defaults were inlined:
+* `load_gputrace_export(pods_csv, nodes_csv)` — reads files written by
+  `gputrace export --format k8s_sim`
+* `load_gputrace_dataframe(df, n_nodes=0, gpus_per_node=8)` — same
+  conversion directly from an in-memory unified-schema DataFrame, no CSV
+  round trip
 
-- **No live k8s API / scheduler framework.** The original registers these
-  as `framework.ScorePlugin`s and runs them inside a fake API server driven
-  by real `client-go` informers; here `Cluster.schedule_pod` just directly
-  filters + scores + mutates node state.
-- **No node affinity / taints / tolerations / topology spread** (`pkg/algo/*.go`).
-  Only GPU-type accessibility and CPU/GPU capacity are checked as filters.
-- **Dot-Product** always uses the "merge GPU dimensions" + `NormByPod` tanh
-  normalization; the original supports 3 dimension-extension methods
-  (`MergeGpuDim`, `SeparateGpuDim*`, `ExtGpuDim`) and 3 normalization modes
-  as CLI config.
-- **GPU-Clustering** keys "affinity" off `pod.gpu_type` (or an explicit
-  `affinity_key`) rather than a GPU-vendor/model annotation string parsed
-  off a live pod object — same mechanic, simpler input.
-- **`GetTypicalPods`** (deriving a typical-pod distribution + popularity
-  threshold from a real trace) is replaced by
-  `fragmentation.build_typical_pods_uniform` / a hand-specified list in
-  `demo.py`. Wire in real trace data by constructing `TargetPod` objects
-  yourself from parsed pod specs.
-- **No descheduling / eviction / multi-scheduler-cycle replay**
-  (`pkg/simulator/deschedule*.go`, `analysis.go`, `export.go`); this port
-  is single-pass bin-packing, which is what you need to compare scoring
-  policies.
-- **No skyline / Bellman-equation fragmentation variant** — the original has
-  a more expensive DP-based fragmentation estimator in `frag.go` that's
-  commented out / deprecated upstream in favor of `NodeGpuShareFragAmount`,
-  which is what's ported here.
+Both preserve `submit_time`/`duration` as `TimedPodEvent`s sorted for
+`EventDrivenRunner`. Field mapping: `num_cpu × 1000 → milli_cpu`,
+`num_gpu × gpu_milli_per_device → milli_gpu` (using the trace's
+`gpu_milli` column when present — see gputrace's schema docs — else
+assuming whole-device requests), `num_gpu (rounded) → gpu_number`,
+`gpu_type` passthrough. Node topology (`nodes.csv`) is synthesized from
+aggregate demand at a target utilization if not fixed — see
+`gputrace/exporters/k8s_sim.py::_synthesize_nodes` for exactly how and why
+that's a tunable starting point, not a validated cluster spec.
 
-## CI / adding a new policy
+## Tests
 
 ```bash
-pip install -r requirements-dev.txt
-make ci        # lint + full test suite + both demos, same as GitHub Actions runs
+pip install -e ".[dev]"
+pytest tests/ -v
 ```
 
-Every policy registered in `k8s_sim.policies.POLICIES` (currently 11, see
-"Benchmark algorithms" above) is automatically checked by
-`tests/test_policy_contract.py` and `tests/test_cluster.py` against a
-compatibility contract (score range, determinism, no side effects, resource
-conservation, correct filtering) — no per-policy test code required.
-`tests/test_experiment.py` additionally smoke-tests the benchmark/plotting
-pipeline itself. `.github/workflows/ci.yml` runs all of this on every
-push/PR across Python 3.9–3.12, plus a benchmark+plotting smoke step. See
-**CONTRIBUTING.md** for the exact contract, how to add a new policy, and how
-to read a failure (assertion messages name the policy, the contract clause,
-and the offending node/pod).
+31 tests: resource add/remove correctness, every policy's basic placement
+behavior, best/worst-fit leftover-size sanity checks, fragmentation
+scoring, an explicit fgd-vs-best-fit disagreement case, event-runtime
+queueing/release/timeout/oversized-pod-rejection behavior, seed
+reproducibility, and — the one that matters most — the bursty-vs-smooth
+rejection-rate comparison that static scheduling structurally cannot
+produce.
 
-## Extending
+## Advanced experiments — next steps
 
-- To score with a **real trace**: parse your pod specs into `PodResource`
-  objects, build a frequency-weighted `TargetPod` list (port
-  `GetTypicalPods` if you want the exact popularity-threshold chopping
-  logic), and call `cluster.schedule_pods(pods, policy, typical_pods=...)`.
-- To add a **new policy**: write a function
-  `score(node, pod, ctx) -> float` and register it in `policies.POLICIES`.
-- To model **pod completion / eviction**: call `NodeResource.add(pod)` to
-  release resources back onto a node (mirrors `Add` in the original).
+1. **Preemption/eviction.** `spot_preemption_churn` currently only encodes
+   preemption as early-terminated jobs (status=`killed`, shortened
+   duration) in the *trace*; the scheduler itself has no eviction policy
+   of its own yet. Next: let a policy actively evict a lower-priority
+   running pod to admit a higher-priority arrival, via `NodeResource.remove()`
+   + re-queueing the evicted pod, and report an eviction-count metric.
+2. **SLO-aware admission.** `max_queue_time` today is a single global
+   config; make it per-job (from a `priority`/`deadline` column gputrace
+   could add) and report SLO-violation rate as a first-class metric
+   alongside rejection rate.
+3. **Autoscaling.** Let `Cluster` add/remove nodes in response to queue
+   depth crossing a threshold, and measure time-to-scale vs. rejection
+   rate tradeoffs under each scenario — directly answers "how many spare
+   nodes do we actually need to absorb a flash crowd."
+4. **Cost model.** Attach a $/node-hour to node types and report
+   cost-per-admitted-job alongside performance metrics, so scheduler
+   comparisons aren't purely throughput/latency — turns the sweep into a
+   genuine Pareto-frontier (cost vs. rejection vs. p95 wait) exploration
+   across policies.
+5. **Multi-tenant fairness.** `moe_expert_load_skew`'s Zipf-skewed users
+   are in the trace already; add a fairness metric (e.g. Jain's index over
+   per-user wait time or admitted share) to the sweep output so a policy
+   that looks good in aggregate but starves the long tail of users is
+   visible.
+6. **Statistical rigor on the sweep.** `experiment.py` already runs
+   multiple seeds; add confidence intervals / paired significance tests
+   (e.g. Wilcoxon signed-rank across matched seeds) to the output so
+   "policy A beats B" claims from the sweep are backed by more than a
+   single point estimate.

@@ -1,200 +1,195 @@
 """
-Experiment / benchmark-suite driver, standing in for the original project's
-experiments/run_scripts + scripts/analysis.py + experiments/analysis
-(merge_*.py) pipeline: run bin/simon over many (policy, workload, scale,
-seed) combinations, dump a "Cluster Analysis Results" block per run, then
-merge everything into a handful of tidy CSVs for plotting.
+Benchmark sweep driver.
 
-Here it's one Python module: `run_experiment` produces the per-run analysis
-(mirrors the log block the original prints after every `simon apply`), and
-`run_benchmark_suite` sweeps a grid of configs and writes tidy CSVs to
-experiments/results/ that `experiments/plot.py` consumes directly -- no log
-scraping required.
+Runs every registered policy against every gputrace scenario export found
+under a directory, at multiple scales and seeds, in time-driven mode
+(``EventDrivenRunner``) — this is the mode that actually exercises the
+arrival-dynamics differences between scenarios; see
+``event_runtime.py``/``gputrace_bridge.py`` docstrings for why static mode
+can't. A static-mode sweep is also available for pure packing-quality
+comparisons where time genuinely doesn't matter.
+
+Expects a directory laid out as gputrace's ``generate-all`` + per-scenario
+``export`` would produce:
+
+    traces/
+      bursty_arrivals/pods.csv
+      bursty_arrivals/nodes.csv
+      diurnal_pattern/pods.csv
+      diurnal_pattern/nodes.csv
+      ...
+
+CLI:
+    python -m k8s_sim.experiment --traces-dir traces/ --policies fgd,best_fit,random \
+        --seeds 1,2,3 --scale 1.0,0.5,2.0 --out results.csv --mode time-driven
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
-import os
-import time
-from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional, Sequence
+import sys
+from dataclasses import asdict
+from pathlib import Path
+from typing import List
 
 from .cluster import Cluster
-from .resource import NodeResource
-from .fragmentation import node_gpu_share_frag_amount, FRAG_TYPES
-from .trace import load_nodes_csv, load_pods_csv, build_typical_pods, list_available_traces, DATA_DIR
-from . import policies as policy_mod
-
-RESULTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "experiments", "results")
-
-# Curated subset of data/csv/openb_pod_list_*.csv, one representative per
-# workload-mix category (mirrors the four alloc-bar categories in the
-# original repo's experiments/plot/plot_openb_*_alloc_bar.py scripts).
-WORKLOAD_CATEGORIES: Dict[str, str] = {
-    "default": "openb_pod_list_default.csv",
-    "cpu-heavy": "openb_pod_list_cpu300.csv",
-    "gpu-share-heavy": "openb_pod_list_gpushare100.csv",
-    "multi-gpu-heavy": "openb_pod_list_multigpu50.csv",
-    "gpu-type-constrained": "openb_pod_list_gpuspec33.csv",
-}
+from .event_runtime import EventDrivenRunner, RunConfig
+from .fragmentation import build_typical_pods
+from .gputrace_bridge import load_gputrace_export
+from .policies import list_policies
+from .trace import reset_cluster
 
 
-@dataclass
-class RunConfig:
-    policy: str
-    workload: str            # trace filename, e.g. "openb_pod_list_gpushare100.csv"
-    n_pods: int
-    seed: int = 0
-    sample: bool = True
-
-
-@dataclass
-class RunResult:
-    policy: str
-    workload: str
-    n_pods: int
-    seed: int
-    scheduled: int
-    unscheduled: int
-    alloc_ratio_cpu: float
-    alloc_ratio_gpu: float
-    alloc_ratio_milli_gpu: float
-    frag_ratio: float
-    # fragmentation bucket breakdown, as percentages of total idle GPU-milli
-    frag_pct: Dict[str, float] = field(default_factory=dict)
-    elapsed_sec: float = 0.0
-
-
-def run_experiment(config: RunConfig,
-                    nodes: Optional[Sequence[NodeResource]] = None) -> RunResult:
-    """Run one (policy, workload, scale, seed) experiment and produce the
-    same headline numbers the original's 'Cluster Analysis Results' log
-    block reports: allocation ratios per resource, and the Q1-Q4/XL/XR/
-    NoAccess fragmentation breakdown."""
-    t0 = time.time()
-
-    node_list = list(nodes) if nodes is not None else load_nodes_csv()
-    workload_path = config.workload if os.path.isabs(config.workload) else os.path.join(DATA_DIR, config.workload)
-    trace_pods = load_pods_csv(path=workload_path, limit=config.n_pods, sample=config.sample, seed=config.seed)
-    pods = [tp.pod for tp in trace_pods]
-    typical = build_typical_pods(trace_pods)
-
-    cluster = Cluster(node_list)
-    result = cluster.schedule_pods(pods, config.policy, typical_pods=typical)
-    util = cluster.utilization()
-    frag_ratio = cluster.fragmentation_ratio(typical)
-
-    # aggregate fragmentation bucket breakdown across all nodes, as % of total idle gpu-milli
-    totals = {t: 0.0 for t in FRAG_TYPES}
-    for node in cluster.node_list():
-        amt = node_gpu_share_frag_amount(node, typical)
-        for k, v in amt.items():
-            totals[k] += v
-    grand_total = sum(totals.values())
-    frag_pct = {k: (v / grand_total * 100.0 if grand_total else 0.0) for k, v in totals.items()}
-
-    milli_gpu_alloc = util["gpu_utilization"]  # already a fraction of total milli-gpu capacity
-
-    return RunResult(
-        policy=config.policy,
-        workload=config.workload,
-        n_pods=config.n_pods,
-        seed=config.seed,
-        scheduled=len(result.scheduled),
-        unscheduled=len(result.unscheduled),
-        alloc_ratio_cpu=util["cpu_utilization"],
-        alloc_ratio_gpu=util["gpu_utilization"],
-        alloc_ratio_milli_gpu=milli_gpu_alloc,
-        frag_ratio=frag_ratio,
-        frag_pct=frag_pct,
-        elapsed_sec=time.time() - t0,
-    )
-
-
-def print_analysis(r: RunResult) -> None:
-    """Pretty-print in the same spirit as the original's
-    'Cluster Analysis Results' console block."""
-    print(f"========== Cluster Analysis Results ({r.policy} / {r.workload}, n={r.n_pods}, seed={r.seed}) ==========")
-    print("Allocation Ratio:")
-    print(f"    MilliCpu : {r.alloc_ratio_cpu*100:5.1f}%")
-    print(f"    Gpu      : {r.alloc_ratio_gpu*100:5.1f}%")
-    for t in FRAG_TYPES:
-        print(f"{t:14s}: {r.frag_pct.get(t, 0.0):5.2f}%")
-    print(f"frag_ratio (non-Q3 share of idle GPU): {r.frag_ratio*100:5.2f}%")
-    print(f"scheduled={r.scheduled} unscheduled={r.unscheduled} elapsed={r.elapsed_sec:.2f}s")
-    print("=" * 60)
-
-
-def run_benchmark_suite(policies: Optional[Sequence[str]] = None,
-                         workloads: Optional[Sequence[str]] = None,
-                         pod_counts: Sequence[int] = (300,),
-                         seeds: Sequence[int] = (0, 1, 2),
-                         node_sample_size: Optional[int] = None,
-                         node_sample_seed: int = 0,
-                         out_path: Optional[str] = None,
-                         verbose: bool = True) -> List[RunResult]:
-    """Sweep a grid of (policy x workload x n_pods x seed) and write a tidy
-    CSV to experiments/results/benchmark_<timestamp>.csv (or `out_path`).
-    Node list is loaded once and reused (fresh Cluster copy per run) for speed.
-    Returns the list of RunResult so callers can also pass it straight to
-    experiments/plot.py without touching disk.
-
-    The full 1523-node cluster makes FGD's per-GPU trial scoring the
-    dominant cost (O(candidates x gpus x typical_pods) per pod). For a quick
-    sweep across many (policy, workload) combinations, set
-    `node_sample_size` to a smaller random subset of nodes -- see
-    `experiments/run_benchmark.py` for curated fast-vs-full presets.
+def _scale_events(events, factor: float):
+    """Scale offered load by ``factor`` by subsampling (factor<1) or
+    duplicating-with-jitter (factor>1) the event list — a cheap way to
+    sweep contention level without regenerating traces from gputrace. For
+    factor > 1, duplicated copies are offset by a small time jitter within
+    each original inter-arrival gap so they don't all land at literally
+    the same instant.
     """
-    policies = list(policies) if policies is not None else list(policy_mod.POLICIES.keys())
-    workloads = list(workloads) if workloads is not None else list_available_traces()
+    import numpy as np
 
-    nodes = load_nodes_csv()
-    if node_sample_size is not None and node_sample_size < len(nodes):
-        import random
-        nodes = random.Random(node_sample_seed).sample(nodes, node_sample_size)
+    if factor == 1.0:
+        return list(events)
+    rng = np.random.default_rng(0)
+    if factor < 1.0:
+        n_keep = max(1, int(len(events) * factor))
+        idx = np.sort(rng.choice(len(events), size=n_keep, replace=False))
+        return [events[i] for i in idx]
 
-    all_results: List[RunResult] = []
+    # factor > 1: duplicate with small jitter, preserve sortedness
+    from .gputrace_bridge import TimedPodEvent
+    from .resource import PodResource
 
-    total = len(policies) * len(workloads) * len(pod_counts) * len(seeds)
-    i = 0
-    for workload in workloads:
-        for n_pods in pod_counts:
+    extra_needed = int(len(events) * (factor - 1))
+    out = list(events)
+    for i in range(extra_needed):
+        src = events[i % len(events)]
+        jitter = rng.uniform(0, 1.0)
+        dup_pod = PodResource(
+            pod_id=f"{src.pod.pod_id}_dup{i}",
+            milli_cpu=src.pod.milli_cpu, milli_gpu=src.pod.milli_gpu,
+            gpu_number=src.pod.gpu_number, gpu_type=src.pod.gpu_type, user=src.pod.user,
+        )
+        out.append(TimedPodEvent(submit_time=src.submit_time + jitter, duration=src.duration, pod=dup_pod))
+    out.sort(key=lambda e: e.submit_time)
+    return out
+
+
+def run_time_driven_sweep(traces_dir: Path, policies: List[str], seeds: List[int],
+                           scales: List[float]) -> List[dict]:
+    rows = []
+    scenario_dirs = sorted(p for p in traces_dir.iterdir() if (p / "pods.csv").exists())
+    if not scenario_dirs:
+        print(f"no scenario exports found under {traces_dir} (expected <scenario>/pods.csv + nodes.csv)",
+              file=sys.stderr)
+
+    for scenario_dir in scenario_dirs:
+        scenario = scenario_dir.name
+        base_nodes, base_events = load_gputrace_export(scenario_dir / "pods.csv", scenario_dir / "nodes.csv")
+
+        for scale in scales:
+            events = _scale_events(base_events, scale)
+            typical_pods = build_typical_pods([e.pod for e in events])
+
+            for policy in policies:
+                for seed in seeds:
+                    nodes = reset_cluster(base_nodes)
+                    cluster = Cluster(nodes)
+                    runner = EventDrivenRunner(cluster, RunConfig(policy=policy, seed=seed))
+                    result = runner.run(events, typical_pods=typical_pods)
+
+                    rows.append({
+                        "scenario": scenario,
+                        "policy": policy,
+                        "scale": scale,
+                        "seed": seed,
+                        "n_submitted": result.n_submitted,
+                        "n_admitted": result.n_admitted,
+                        "rejection_rate": result.rejection_rate,
+                        "mean_wait_time": result.mean_wait_time,
+                        "p95_wait_time": result.p95_wait_time,
+                        "makespan": result.makespan,
+                        "final_fragmentation_score": cluster.fragmentation_score(typical_pods),
+                        "final_gpu_utilization": cluster.total_gpu_utilization(),
+                    })
+                    print(f"  {scenario:28s} {policy:16s} scale={scale:<5} seed={seed}  "
+                          f"reject={result.rejection_rate:.3f} mean_wait={result.mean_wait_time:.1f}",
+                          file=sys.stderr)
+    return rows
+
+
+def run_static_sweep(traces_dir: Path, policies: List[str], seeds: List[int]) -> List[dict]:
+    """Packing-quality-only comparison: schedule every scenario's pods in
+    submission order with no time dimension. Included for completeness /
+    comparison against the time-driven results — this is what the
+    original snapshot-only design could measure.
+    """
+    from .trace import load_nodes_csv, load_pods_csv
+
+    rows = []
+    scenario_dirs = sorted(p for p in traces_dir.iterdir() if (p / "pods.csv").exists())
+    for scenario_dir in scenario_dirs:
+        scenario = scenario_dir.name
+        base_nodes = load_nodes_csv(scenario_dir / "nodes.csv")
+        pods = load_pods_csv(scenario_dir / "pods.csv")
+        typical_pods = build_typical_pods(pods)
+
+        for policy in policies:
             for seed in seeds:
-                for policy in policies:
-                    i += 1
-                    cfg = RunConfig(policy=policy, workload=workload, n_pods=n_pods, seed=seed)
-                    r = run_experiment(cfg, nodes=nodes)
-                    all_results.append(r)
-                    if verbose:
-                        print(f"[{i}/{total}] {policy:<16} {workload:<32} n={n_pods:<5} seed={seed} "
-                              f"-> frag_ratio={r.frag_ratio*100:5.1f}% "
-                              f"sched={r.scheduled}/{r.scheduled + r.unscheduled}")
-
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    out_path = out_path or os.path.join(RESULTS_DIR, f"benchmark_{time.strftime('%Y%m%d_%H%M%S')}.csv")
-    _write_results_csv(all_results, out_path)
-    # also refresh a stable "latest" pointer that plot.py defaults to
-    _write_results_csv(all_results, os.path.join(RESULTS_DIR, "latest.csv"))
-    if verbose:
-        print(f"\nWrote {len(all_results)} rows to {out_path}")
-    return all_results
+                nodes = reset_cluster(base_nodes)
+                cluster = Cluster(nodes)
+                results = cluster.schedule_pods(pods, policy=policy, typical_pods=typical_pods, seed=seed)
+                n_admitted = sum(1 for r in results if r.node_id is not None)
+                rows.append({
+                    "scenario": scenario,
+                    "policy": policy,
+                    "seed": seed,
+                    "n_submitted": len(pods),
+                    "n_admitted": n_admitted,
+                    "rejection_rate": 1 - n_admitted / len(pods) if pods else 0.0,
+                    "fragmentation_score": cluster.fragmentation_score(typical_pods),
+                    "gpu_utilization": cluster.total_gpu_utilization(),
+                })
+    return rows
 
 
-def _write_results_csv(results: Sequence[RunResult], path: str) -> None:
-    if not results:
+def _write_csv(rows: List[dict], out_path: Path) -> None:
+    if not rows:
+        print("no results to write", file=sys.stderr)
         return
-    frag_keys = list(results[0].frag_pct.keys())
-    fieldnames = ["policy", "workload", "n_pods", "seed", "scheduled", "unscheduled",
-                  "alloc_ratio_cpu", "alloc_ratio_gpu", "alloc_ratio_milli_gpu",
-                  "frag_ratio", "elapsed_sec"] + [f"frag_pct_{k}" for k in frag_keys]
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
         writer.writeheader()
-        for r in results:
-            row = asdict(r)
-            frag_pct = row.pop("frag_pct")
-            for k, v in frag_pct.items():
-                row[f"frag_pct_{k}"] = v
-            writer.writerow(row)
+        writer.writerows(rows)
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--traces-dir", required=True, type=Path)
+    p.add_argument("--policies", default=",".join(list_policies()))
+    p.add_argument("--seeds", default="1,2,3")
+    p.add_argument("--scale", default="1.0")
+    p.add_argument("--mode", choices=["time-driven", "static"], default="time-driven")
+    p.add_argument("--out", required=True, type=Path)
+    args = p.parse_args(argv)
+
+    policies = args.policies.split(",")
+    seeds = [int(s) for s in args.seeds.split(",")]
+
+    if args.mode == "time-driven":
+        scales = [float(s) for s in args.scale.split(",")]
+        rows = run_time_driven_sweep(args.traces_dir, policies, seeds, scales)
+    else:
+        rows = run_static_sweep(args.traces_dir, policies, seeds)
+
+    _write_csv(rows, args.out)
+    print(f"wrote {len(rows)} rows -> {args.out}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
