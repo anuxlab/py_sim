@@ -14,31 +14,39 @@ on the same trace, not variations of one engine -- see docs/HTAFM.md.
 Run: python3 htafm_demo.py [n_demands]
 """
 
+import csv
 import sys
 
-from k8s_sim.topology import load_topology_from_csv, TopoDemand
-from k8s_sim.htafm import HTAFMScheduler, HTAFMConfig, compute_tafi
-from k8s_sim.trace import load_nodes_csv, load_pods_csv, build_typical_pods
 from k8s_sim import Cluster
+from k8s_sim.htafm import HTAFMConfig, HTAFMScheduler
+from k8s_sim.topology import TopoDemand, load_topology_from_csv
+from k8s_sim.trace import DEFAULT_POD_TRACE, load_real_trace_nodes, load_real_trace_pods, reset_cluster
+from k8s_sim.trace import DATA_DIR as _DATA_DIR
 
 
-def run_htafm(variant, trace_pods, n_demands, **topo_kwargs):
+def _load_demands(n_demands: int) -> list:
+    """H-TAFM needs `memory_mib` per pod (Section 1.1's multi-resource
+    demand vector), which PodResource doesn't carry -- read it straight
+    from the raw trace CSV rather than through load_real_trace_pods()."""
+    path = f"{_DATA_DIR}/{DEFAULT_POD_TRACE}"
+    demands = []
+    with open(path, newline="") as f:
+        for row in list(csv.DictReader(f))[:n_demands]:
+            num_gpu = int(row["num_gpu"])
+            gpu_milli = int(row["gpu_milli"]) if row.get("gpu_milli", "") not in ("", None) else 0
+            demands.append(TopoDemand(
+                milli_cpu=int(row["cpu_milli"]),
+                memory_mib=int(row["memory_mib"]),
+                milli_gpu=gpu_milli if num_gpu > 0 else 0,
+                gpu_number=num_gpu,
+                gpu_type=(row.get("gpu_spec") or "").strip(),
+                name=row["name"],
+            ))
+    return demands
+
+
+def run_htafm(variant: str, demands: list, **topo_kwargs) -> dict:
     topo = load_topology_from_csv(**topo_kwargs)
-    demands = [
-        TopoDemand(milli_cpu=tp.pod.milli_cpu, memory_mib=0, milli_gpu=tp.pod.milli_gpu,
-                   gpu_number=tp.pod.gpu_number, gpu_type=tp.pod.gpu_type, name=tp.pod.name)
-        for tp in trace_pods[:n_demands]
-    ]
-    # pull memory_mib back out of the raw CSV rows (PodResource doesn't carry it)
-    import csv
-    import os
-    from k8s_sim.trace import DATA_DIR, DEFAULT_POD_TRACE
-    mem_by_name = {}
-    with open(os.path.join(DATA_DIR, DEFAULT_POD_TRACE), newline="") as f:
-        for row in csv.DictReader(f):
-            mem_by_name[row["name"]] = int(row["memory_mib"])
-    for d in demands:
-        d.memory_mib = mem_by_name.get(d.name, 0)
 
     if variant == "cut":
         pending = [TopoDemand(milli_cpu=d.milli_cpu, memory_mib=d.memory_mib,
@@ -61,36 +69,39 @@ def run_htafm(variant, trace_pods, n_demands, **topo_kwargs):
     }
 
 
-def run_baseline(policy, nodes, trace_pods, n_demands, typical):
-    pods = [tp.pod for tp in trace_pods[:n_demands]]
+def run_baseline(policy: str, nodes_master: dict, pods: list, typical: list) -> dict:
+    nodes = reset_cluster(nodes_master)
     cluster = Cluster(nodes)
-    result = cluster.schedule_pods(pods, policy, typical_pods=typical)
-    total_gpu = sum(n.gpu_number for n in cluster.node_list())
-    unallocated = sum(n.total_milli_gpu_left() for n in cluster.node_list()) / 1000.0
+    results = cluster.schedule_pods(pods, policy, typical_pods=typical)
+    n_scheduled = sum(1 for r in results if r.node_id is not None)
+    total_gpu = sum(n.gpu_count for n in cluster.node_list)
+    unallocated = sum(n.remaining_milli_gpu for n in cluster.node_list) / 1000.0
     return {
         "policy": policy,
-        "scheduled": len(result.scheduled),
-        "unscheduled": len(result.unscheduled),
+        "scheduled": n_scheduled,
+        "unscheduled": len(results) - n_scheduled,
         "unallocated_gpus": unallocated,
         "total_gpus": total_gpu,
-        "acceptance_rate": len(result.scheduled) / max(1, len(pods)),
+        "acceptance_rate": n_scheduled / max(1, len(pods)),
     }
 
 
 def main():
     n_demands = int(sys.argv[1]) if len(sys.argv) > 1 else 300
 
-    trace_pods = load_pods_csv(limit=n_demands, sample=True, seed=0)
-    nodes = load_nodes_csv()
-    typical = build_typical_pods(trace_pods)
+    demands = _load_demands(n_demands)
+    nodes_master = load_real_trace_nodes()
+    pods = load_real_trace_pods(limit=n_demands)  # same prefix as _load_demands, for apples-to-apples
+    from k8s_sim.fragmentation import build_typical_pods
+    typical = build_typical_pods(pods)
 
     rows = []
     for variant in ["cut", "entropy", "hier"]:
         print(f"running h-tafm-{variant}...", file=sys.stderr)
-        rows.append(run_htafm(variant, trace_pods, n_demands, nodes_per_rack=40))
-    for policy in ["random", "best-fit", "fgd"]:
+        rows.append(run_htafm(variant, demands, nodes_per_rack=40))
+    for policy in ["random", "best_fit", "fgd"]:
         print(f"running {policy}...", file=sys.stderr)
-        rows.append(run_baseline(policy, nodes, trace_pods, n_demands, typical))
+        rows.append(run_baseline(policy, nodes_master, pods, typical))
 
     header = f"{'policy':<16}{'scheduled':>10}{'unscheduled':>13}{'accept_rate':>13}{'unalloc_gpus':>14}{'total_gpus':>12}"
     print(header)

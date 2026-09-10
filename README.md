@@ -170,6 +170,47 @@ aggregate demand at a target utilization if not fixed — see
 `gputrace/exporters/k8s_sim.py::_synthesize_nodes` for exactly how and why
 that's a tunable starting point, not a validated cluster spec.
 
+## H-TAFM (Hypergraph-based Topology-Aware Fragmentation Metric)
+
+`k8s_sim/topology.py` + `k8s_sim/htafm.py` implement a second, independent
+placement engine operating at NUMA-vertex granularity (one level below the
+whole-node granularity everything else in this repo uses), scoring
+placements against a weighted Socket/Server/Rack hypergraph rather than
+flat leftover capacity. It's a from-the-methodology implementation with
+citations and documented ambiguity resolutions in `docs/HTAFM.md` — worth
+reading before using it, since a couple of interpretation calls were
+required to turn the source methodology into working code.
+
+```bash
+python3 htafm_demo.py 300   # compares h-tafm-{cut,entropy,hier} against
+                             # random/best_fit/fgd on the real bundled trace
+```
+
+Because it's a different placement granularity, not a different scoring
+function, it isn't registered in `k8s_sim.policies.POLICIES` — it has its
+own `Topology`/`HTAFMScheduler`, built via `load_topology_from_csv()` on
+the same real `data/csv/openb_node_list_*.csv` data everything else here
+uses (NUMA/socket/rack structure is synthesized on top, since the trace
+itself has no sub-node topology — see `topology.py`'s module docstring for
+exactly what's real vs. synthesized).
+
+## Loading the real bundled trace data
+
+Separately from the gputrace bridge, `k8s_sim/trace.py` also reads the
+real production trace shipped in `data/csv/` (1523 nodes / 8152 pods from
+a live heterogeneous GPU cluster — see `data/ORIGINAL_DATA_README.md`),
+via `load_real_trace_nodes()` / `load_real_trace_pods()`. These are
+separate functions from `load_nodes_csv()`/`load_pods_csv()`, which read
+the *gputrace-export* CSV schema — the two schemas (raw Alibaba columns
+like `sn`/`cpu_milli`/`gpu`/`model` vs. gputrace's `node_id`/
+`milli_cpu_capacity`/`gpu_count`/`gpu_type`) are different, so both loader
+pairs are kept, rather than one silently guessing which schema a given
+CSV is in.
+
+```bash
+python3 trace_demo.py openb_pod_list_gpushare100.csv 500
+```
+
 ## Tests
 
 ```bash
@@ -184,6 +225,101 @@ queueing/release/timeout/oversized-pod-rejection behavior, seed
 reproducibility, and — the one that matters most — the bursty-vs-smooth
 rejection-rate comparison that static scheduling structurally cannot
 produce.
+
+## Using this together with gputrace (full local walkthrough)
+
+Every command below is exactly what CI's `gputrace-integration` job runs
+(`.github/workflows/ci.yml`) — this is copy-pasteable, not illustrative.
+
+```bash
+# 0. Get both repos side by side and install both
+git clone https://github.com/anuxlab/simulated_data_generation_GPU_Scheduling.git gputrace
+git clone https://github.com/anuxlab/py_sim.git
+cd py_sim
+pip install -e ".[gputrace]"       # numpy + pandas (for the DataFrame bridge)
+pip install -e ../gputrace         # or: pip install "git+https://github.com/anuxlab/simulated_data_generation_GPU_Scheduling.git"
+
+# 1. Fit distributions to a real trace (optional -- every gputrace command
+#    below works with no --fit at all, using its built-in reference fit,
+#    if you just want to try the pipeline without a real trace on hand)
+gputrace analyze --loader alibaba2020 --input pai_task_table_sample.csv --out fit.json
+
+# 2. Generate every stress scenario and export each to k8s_sim's native format
+gputrace generate-all --fit fit.json --n-jobs 20000 --seed 1 --out-dir /tmp/gt_traces
+mkdir -p traces
+for f in /tmp/gt_traces/*.csv; do
+  name=$(basename "$f" .csv)
+  gputrace export --input "$f" --format k8s_sim --out-dir "traces/$name" --n-nodes 20 --gpus-per-node 8
+done
+
+# 3. Sweep every scheduling policy against every scenario, in time-driven mode
+python -m k8s_sim.experiment --traces-dir traces \
+    --policies fgd,best_fit,random,worst_fit,least_requested,round_robin,gpu_packing,first_fit \
+    --seeds 1,2,3 --mode time-driven --out results.csv
+
+# 4. ...or the equivalent, already wired up, in one Python process:
+python3 experiments/full_pipeline_example.py
+```
+
+`results.csv` is one row per (scenario, policy, scale, seed) with
+`rejection_rate`, `mean_wait_time`, `p95_wait_time`, `makespan`,
+`final_fragmentation_score`, `final_gpu_utilization` — see "The benchmark
+sweep" above for column details and `--scale` sweeping.
+
+## Recent CI fixes (what changed and why)
+
+The CI workflow was failing because a prior refactor commit (rewriting
+`resource.py`/`cluster.py`/`trace.py` around the new gputrace integration)
+also deleted `k8s_sim/topology.py`, `htafm.py`, `simulation.py`,
+`metrics.py`, `k8s_sim/plotting.py`, `experiments/run_benchmark.py`, and
+two test files — while `.github/workflows/ci.yml` and four top-level demo
+scripts (`demo.py`, `trace_demo.py`, `htafm_demo.py`, `simulation_demo.py`)
+still referenced the old files and the pre-refactor API (old field names
+like `NodeResource(name=..., milli_cpu_left=...)` instead of the current
+`NodeResource(node_id=..., milli_cpu_capacity=...)`).
+
+Resolution, file by file:
+
+* **`topology.py` + `htafm.py`** — restored from git history. Both are
+  self-contained (no dependency on the rewritten core), still documented
+  in `docs/HTAFM.md`, and the new README never mentioned dropping them —
+  this looked like collateral damage from the refactor, not an
+  intentional removal, so they're back. `htafm_demo.py` was rewritten
+  against the current `trace.py`/`resource.py` API; `load_real_trace_nodes()`/
+  `load_real_trace_pods()` were added to `trace.py` (additive only — the
+  gputrace-facing `load_nodes_csv()`/`load_pods_csv()` are untouched) so
+  both `topology.py` and `trace_demo.py` can read the real bundled data
+  again.
+* **`demo.py` / `trace_demo.py`** — rewritten against the current
+  `PodResource`/`NodeResource`/`Cluster`/`fragmentation` API. No missing
+  functionality, just stale field names and return types from before the
+  refactor.
+* **`simulation.py` / `metrics.py` / `simulation_demo.py`** — **not**
+  restored. `simulation.py` depended on types that were themselves removed
+  in the same rewrite (`fragmentation.TargetPod`, `trace.TracePod`), and
+  the README already describes `event_runtime.EventDrivenRunner` as its
+  intentional successor — reviving code built on already-gone internals
+  looked like the wrong call here. `simulation_demo.py` is deleted;
+  `experiments/full_pipeline_example.py` is the current equivalent.
+* **`experiments/run_benchmark.py` + `k8s_sim/plotting.py`** — **not**
+  restored; they produced a different (node-count-sweep, static-mode-only)
+  CSV schema that predates the gputrace integration. `k8s_sim.experiment`
+  is the current, actively-used benchmark driver and already produces a
+  plain tabular CSV — see the "gputrace-integration" and "benchmark" CI
+  jobs. No plotting step was re-added; that's a reasonable follow-up if
+  you want charts, not something re-created speculatively here.
+* **CI workflow** — `new-policy-check` now points at the consolidated
+  `tests/test_k8s_sim.py -k "every_policy"` (the old `test_cluster.py` /
+  `test_policy_contract.py` it referenced are gone, superseded by that
+  file). The `test` job's benchmark+plotting step was replaced with a
+  self-contained static-mode smoke test (no gputrace dependency, fast). A
+  new `gputrace-integration` job installs gputrace from GitHub and runs
+  the real cross-repo pipeline above end to end, uploading its results as
+  an artifact. The `benchmark` job now does the same at full scale instead
+  of calling the deleted `run_benchmark.py`.
+* Added a `.gitignore` — there wasn't one, which is part of how build
+  artifacts/pycache made it easy to lose track of what was intentionally
+  deleted vs. accidentally dropped during the refactor.
 
 ## Advanced experiments — next steps
 

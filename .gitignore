@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.coverage
+coverage.xml
+.venv/
+venv/
+traces/
+integration_results.csv
+benchmark_results.csv
+/tmp/
+.DS_Store

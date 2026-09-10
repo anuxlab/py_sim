@@ -3,9 +3,11 @@ name: CI
 # Runs on every push and PR. This is the compatibility gate for new
 # plugin/algo development: if you add a scoring policy to
 # k8s_sim/policies.POLICIES, this pipeline automatically runs the
-# conformance + integration test suite against it (see tests/test_policy_contract.py
-# and tests/test_cluster.py) and fails with a precise, per-policy message if
-# it isn't compatible.
+# per-policy conformance tests in tests/test_k8s_sim.py
+# (test_every_policy_places_when_capacity_available /
+# test_every_policy_returns_none_when_nothing_fits, parametrized over every
+# registered policy) and fails with a precise, per-policy message if it
+# isn't compatible.
 
 on:
   push:
@@ -44,9 +46,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install test dependencies
-        run: pip install pytest pytest-cov pandas matplotlib
+        run: pip install pytest pytest-cov pandas
 
-      - name: Run unit + conformance + integration tests
+      - name: Run unit + conformance tests
         run: python3 -m pytest -v --cov=k8s_sim --cov-report=term-missing
 
       - name: Smoke-test the synthetic demo
@@ -58,24 +60,26 @@ jobs:
       - name: Smoke-test the H-TAFM demo
         run: python3 htafm_demo.py 50
 
-      - name: Smoke-test the time-driven simulation demo
-        run: python3 simulation_demo.py 50 2
+      # NOTE: the old "time-driven simulation demo" step (simulation_demo.py)
+      # was removed here -- k8s_sim/simulation.py was superseded by
+      # event_runtime.py (time-driven mode is now exercised below and by
+      # experiments/full_pipeline_example.py in the gputrace-integration job).
 
-      - name: Smoke-test the benchmark + plotting pipeline
+      - name: Smoke-test the static-mode benchmark sweep (self-contained, no gputrace needed)
         run: |
           python3 -c "
-          from k8s_sim.experiment import run_benchmark_suite
-          from k8s_sim import plotting
-          run_benchmark_suite(
-              policies=['random', 'fgd', 'best-fit'],
-              workloads=['openb_pod_list_gpushare100.csv'],
-              pod_counts=(30,), seeds=(0,), node_sample_size=30,
-              out_path='/tmp/ci_bench.csv',
-          )
-          df = plotting.load_results('/tmp/ci_bench.csv')
-          plotting.plot_frag_ratio_by_policy(df, out_name='ci_smoke.png')
-          print('benchmark + plotting pipeline OK')
+          import csv, os
+          os.makedirs('/tmp/ci_traces/demo_scenario', exist_ok=True)
+          with open('/tmp/ci_traces/demo_scenario/nodes.csv', 'w', newline='') as f:
+              w = csv.writer(f); w.writerow(['node_id','milli_cpu_capacity','gpu_count','milli_gpu_capacity','gpu_type'])
+              for i in range(10): w.writerow([f'node_{i}', 96000, 8, 8000, 'V100'])
+          with open('/tmp/ci_traces/demo_scenario/pods.csv', 'w', newline='') as f:
+              w = csv.writer(f); w.writerow(['pod_id','submit_time','duration','milli_cpu','milli_gpu','gpu_number','gpu_type','user'])
+              for i in range(40): w.writerow([f'pod_{i}', i*5, 60, 2000, 1000, 1, 'V100', f'user_{i%3}'])
           "
+          python3 -m k8s_sim.experiment --traces-dir /tmp/ci_traces --policies fgd,best_fit,random \
+              --seeds 1 --mode static --out /tmp/ci_bench_static.csv
+          test -f /tmp/ci_bench_static.csv
 
   new-policy-check:
     # Separate, clearly-named job so a failure here reads unambiguously as
@@ -89,16 +93,70 @@ jobs:
           python-version: "3.12"
       - run: pip install pytest
       - name: Verify every registered policy passes the compatibility contract
-        run: python3 -m pytest tests/test_policy_contract.py tests/test_cluster.py -v
+        run: python3 -m pytest tests/test_k8s_sim.py -k "every_policy" -v
+
+  gputrace-integration:
+    # The real cross-repo integration test: install gputrace from its repo,
+    # generate every stress scenario, export to k8s_sim's native format, and
+    # sweep every scheduling policy against every scenario in time-driven
+    # mode -- this is what experiments/full_pipeline_example.py demonstrates,
+    # and what run_time_driven_sweep()/k8s_sim.experiment are built for.
+    # See README.md's "Using this with gputrace" section for the equivalent
+    # commands to run this locally.
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install py_sim + gputrace (from GitHub)
+        run: |
+          pip install -e ".[gputrace]"
+          pip install "git+https://github.com/anuxlab/simulated_data_generation_GPU_Scheduling.git"
+      - name: Generate every gputrace scenario and export to k8s_sim format
+        run: |
+          gputrace generate-all --n-jobs 2000 --out-dir /tmp/gt_traces
+          mkdir -p traces
+          for f in /tmp/gt_traces/*.csv; do
+            name=$(basename "$f" .csv)
+            gputrace export --input "$f" --format k8s_sim --out-dir "traces/$name"
+          done
+      - name: Run the time-driven policy sweep across every scenario
+        run: |
+          python3 -m k8s_sim.experiment --traces-dir traces \
+              --policies fgd,best_fit,random --seeds 1,2 --mode time-driven \
+              --out integration_results.csv
+      - name: Run the ready-made full pipeline example too
+        run: python3 experiments/full_pipeline_example.py
+      - name: Upload integration results
+        uses: actions/upload-artifact@v4
+        with:
+          name: gputrace-integration-results
+          path: integration_results.csv
+          if-no-files-found: error
+          retention-days: 30
 
   benchmark:
-    # Actually runs the benchmark suite and uploads the CSV + plots as a
+    # Runs the full time-driven benchmark sweep (same mechanism as
+    # gputrace-integration above, at larger scale) and uploads the CSV as a
     # downloadable Actions artifact -- this is what produces something you
-    # can look at, unlike the "test" job's throwaway /tmp smoke check.
-    # Runs on every push to main plus manual dispatch (Actions tab -> this
+    # can look at, unlike the "test" job's throwaway /tmp smoke check. Runs
+    # on every push to main plus manual dispatch (Actions tab -> this
     # workflow -> "Run workflow"), not on every PR, since it's slower than
     # the test suite.
-    needs: test
+    #
+    # NOTE: this replaces the old experiments/run_benchmark.py + k8s_sim/plotting.py
+    # pipeline, which produced a different (node-count-sweep, static-mode-only)
+    # CSV schema that predates the gputrace integration and is no longer
+    # compatible with the current k8s_sim.experiment output. No plotting step
+    # is included -- if you want charts back, k8s_sim.experiment's output CSV
+    # (scenario, policy, scale, seed, n_submitted, n_admitted, rejection_rate,
+    # mean_wait_time, p95_wait_time, makespan, final_fragmentation_score,
+    # final_gpu_utilization) is plain tabular data any plotting tool can read
+    # directly; writing a new plotting.py for this schema is a reasonable
+    # follow-up, not something this fix re-creates speculatively.
+    needs: [test, gputrace-integration]
     if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
@@ -106,16 +164,27 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install dependencies
-        run: pip install -r requirements-dev.txt -r requirements-analysis.txt
-      - name: Run benchmark suite (fast preset) and generate plots
-        run: python3 experiments/run_benchmark.py --preset fast
-      - name: Upload results + plots
+      - name: Install py_sim + gputrace (from GitHub)
+        run: |
+          pip install -e ".[gputrace]"
+          pip install "git+https://github.com/anuxlab/simulated_data_generation_GPU_Scheduling.git"
+      - name: Generate every scenario at full scale and export
+        run: |
+          gputrace generate-all --n-jobs 20000 --out-dir /tmp/gt_traces
+          mkdir -p traces
+          for f in /tmp/gt_traces/*.csv; do
+            name=$(basename "$f" .csv)
+            gputrace export --input "$f" --format k8s_sim --out-dir "traces/$name"
+          done
+      - name: Run the full benchmark sweep (every policy x every scenario x 3 seeds)
+        run: |
+          python3 -m k8s_sim.experiment --traces-dir traces \
+              --policies fgd,best_fit,random,worst_fit,least_requested,round_robin,gpu_packing,first_fit \
+              --seeds 1,2,3 --mode time-driven --out benchmark_results.csv
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
-          path: |
-            experiments/results/*.csv
-            experiments/plots/*.png
+          path: benchmark_results.csv
           if-no-files-found: error
           retention-days: 30
