@@ -321,6 +321,58 @@ Resolution, file by file:
   artifacts/pycache made it easy to lose track of what was intentionally
   deleted vs. accidentally dropped during the refactor.
 
+### Round 2: after the first fix, `new-policy-check` failed and `benchmark` ran 3h44m
+
+Two real problems turned up in the first actual Actions run of the fixes above:
+
+* **`new-policy-check` failed in ~10s with pytest exit code 2** ("Interrupted:
+  1 error during collection"). Root cause: that job's install step was
+  `pip install pytest` — it never installed `k8s_sim` itself (or its one
+  dependency, `numpy`), so `tests/test_k8s_sim.py`'s `import k8s_sim` failed
+  before any test could run. Reproduced locally by mirroring the exact broken
+  step; fixed by installing `-e ".[dev]"` instead of bare `pytest`.
+
+* **`benchmark` ran for 3h44m and had to be manually canceled.** This wasn't a
+  hang — profiling `k8s_sim/event_runtime.py` at increasing job counts (200
+  through 4000 jobs) showed clearly *superlinear* growth (2x the jobs → ~4x
+  the time), not the roughly-linear growth you'd want from a discrete-event
+  simulator. The cause: on every pod-release event, the pending-queue drain
+  re-scanned the *entire* remaining pending list in a `while
+  pending_progress` loop that repeated the full scan again for every
+  successful placement within that same release event. Since placing a
+  pending pod only *consumes* cluster capacity — it never frees more — a
+  second pass over the same list can never place anything a first pass
+  didn't already catch, so that repeated re-scanning was pure waste. Removed
+  it (single pass per release event now); verified the output is
+  byte-for-byte identical to the old version on the same inputs before
+  shipping the change, and it's ~1.5-1.6x faster as a direct result. The
+  *default* `benchmark` scale was also reduced from 20,000 jobs x 3 seeds x
+  all 8 policies (336 runs, which — even after the speedup — is genuinely
+  multiple hours, not a hang, at that size) to 3,000 jobs x 2 seeds x all 8
+  policies (224 runs, measured at ~15-20 minutes total). The full-scale sweep
+  is still available on demand via `workflow_dispatch` inputs
+  (`benchmark_n_jobs`, `benchmark_seeds`) if you deliberately want it — see
+  the comments in `.github/workflows/ci.yml`'s `benchmark` job.
+
+  **This remaining superlinear-ish scaling is architectural, not a bug I
+  patched around**: `event_runtime.py`'s pending-queue drain is still a
+  linear rescan of the queue on every release event, so total cost is
+  roughly O(n × average queue depth), which approaches O(n²) whenever a
+  scenario's backlog grows proportionally with job count (e.g. an
+  under-provisioned cluster relative to demand). The single-pass fix removes
+  a large *constant-factor* waste, not the underlying complexity class. If
+  you want to run very large (50k+ job) time-driven sweeps routinely, a
+  proper fix would replace the linear pending-list scan with an indexed
+  structure (e.g. bucketing pending pods by resource-shape so a release only
+  triggers a lookup against pods that could plausibly now fit, not a scan of
+  every pod regardless of shape) — a bigger change than this fix, and one
+  that touches scheduling-semantics code, so it's flagged here rather than
+  made unilaterally.
+
+  Timeouts (`timeout-minutes`) were also added to every job as a safety net,
+  so a future regression fails within a bounded window instead of quietly
+  running for hours again.
+
 ## Advanced experiments — next steps
 
 1. **Preemption/eviction.** `spot_preemption_churn` currently only encodes

@@ -14,7 +14,14 @@ on:
     branches: ["**"]
   pull_request:
     branches: ["**"]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      benchmark_n_jobs:
+        description: "Jobs per scenario for the 'benchmark' job (default 3000; the full-scale run that hung for 3h44m before was 20000 -- see README's 'Recent CI fixes' for the profiling behind this default)"
+        default: "3000"
+      benchmark_seeds:
+        description: "Comma-separated seeds for the 'benchmark' job"
+        default: "1,2"
 
 jobs:
   lint:
@@ -34,6 +41,7 @@ jobs:
   test:
     needs: lint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -86,12 +94,13 @@ jobs:
     # "a scoring policy is not compatible" rather than a generic test failure.
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pytest
+      - run: pip install -e ".[dev]"
       - name: Verify every registered policy passes the compatibility contract
         run: python3 -m pytest tests/test_k8s_sim.py -k "every_policy" -v
 
@@ -105,6 +114,7 @@ jobs:
     # commands to run this locally.
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -140,11 +150,27 @@ jobs:
   benchmark:
     # Runs the full time-driven benchmark sweep (same mechanism as
     # gputrace-integration above, at larger scale) and uploads the CSV as a
-    # downloadable Actions artifact -- this is what produces something you
-    # can look at, unlike the "test" job's throwaway /tmp smoke check. Runs
-    # on every push to main plus manual dispatch (Actions tab -> this
-    # workflow -> "Run workflow"), not on every PR, since it's slower than
-    # the test suite.
+    # downloadable Actions artifact. Runs on every push to main plus manual
+    # dispatch (Actions tab -> this workflow -> "Run workflow", where you
+    # can override benchmark_n_jobs/benchmark_seeds for a deliberately
+    # bigger research run), not on every PR, since it's slower than the
+    # test suite.
+    #
+    # SCALE, AND WHY: a previous version of this job defaulted to
+    # --n-jobs 20000 x all 8 policies x 3 seeds x 14 scenarios (336 runs)
+    # and was manually canceled after 3h44m. Profiling
+    # (k8s_sim/event_runtime.py's pending-queue drain was doing a full
+    # O(pending) rescan *per placement*, not just per release event, making
+    # total cost superlinear -- see that file's docstring) found a single
+    # 20k-job time-driven run alone took several minutes; even after fixing
+    # the redundant rescan (~1.5-1.6x speedup, verified byte-identical
+    # output), 336 runs at that scale is still multiple hours by design,
+    # not a hang. 3000 jobs/scenario x 2 seeds (224 runs) was measured at
+    # ~142s for a 32-run subset -> roughly 15-20 minutes for the full
+    # sweep, comfortably inside the timeout below and still 1.5x the scale
+    # of the gputrace-integration job above. Override via workflow_dispatch
+    # if you deliberately want the multi-hour full-scale sweep; it isn't
+    # wrong, just shouldn't be the automatic default on every push to main.
     #
     # NOTE: this replaces the old experiments/run_benchmark.py + k8s_sim/plotting.py
     # pipeline, which produced a different (node-count-sweep, static-mode-only)
@@ -159,6 +185,7 @@ jobs:
     needs: [test, gputrace-integration]
     if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -168,19 +195,23 @@ jobs:
         run: |
           pip install -e ".[gputrace]"
           pip install "git+https://github.com/anuxlab/simulated_data_generation_GPU_Scheduling.git"
-      - name: Generate every scenario at full scale and export
+      - name: Generate every scenario and export
+        env:
+          N_JOBS: ${{ github.event.inputs.benchmark_n_jobs || '3000' }}
         run: |
-          gputrace generate-all --n-jobs 20000 --out-dir /tmp/gt_traces
+          gputrace generate-all --n-jobs "$N_JOBS" --out-dir /tmp/gt_traces
           mkdir -p traces
           for f in /tmp/gt_traces/*.csv; do
             name=$(basename "$f" .csv)
             gputrace export --input "$f" --format k8s_sim --out-dir "traces/$name"
           done
-      - name: Run the full benchmark sweep (every policy x every scenario x 3 seeds)
+      - name: Run the full benchmark sweep (every policy x every scenario)
+        env:
+          SEEDS: ${{ github.event.inputs.benchmark_seeds || '1,2' }}
         run: |
           python3 -m k8s_sim.experiment --traces-dir traces \
               --policies fgd,best_fit,random,worst_fit,least_requested,round_robin,gpu_packing,first_fit \
-              --seeds 1,2,3 --mode time-driven --out benchmark_results.csv
+              --seeds "$SEEDS" --mode time-driven --out benchmark_results.csv
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
