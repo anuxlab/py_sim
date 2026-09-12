@@ -170,6 +170,51 @@ aggregate demand at a target utilization if not fixed — see
 `gputrace/exporters/k8s_sim.py::_synthesize_nodes` for exactly how and why
 that's a tunable starting point, not a validated cluster spec.
 
+## Running every algorithm against every gputrace scenario
+
+`experiments/full_scenario_matrix.py` runs all 8 node-granularity policies
+*and* all 3 H-TAFM variants (11 algorithms total) against every scenario a
+`gputrace generate-all` + `gputrace export --format k8s_sim` run produces,
+in static (batch) mode -- the only mode H-TAFM has, so it's the only mode
+that can compare all 11 on equal footing. See that script's module
+docstring for the full comparability and memory-assumption caveats before
+trusting absolute numbers (short version: H-TAFM needs a memory dimension
+gputrace's export schema doesn't carry, so one is assumed at a fixed
+MiB-per-milli-cpu ratio; static mode also can't see any scenario whose
+only distinguishing feature is *timing*, not resource size -- several
+gputrace scenarios are timing-only, see the caveat below).
+
+```bash
+gputrace generate-all --n-jobs 300 --seed 42 --out-dir /tmp/gt_traces
+mkdir -p traces
+for f in /tmp/gt_traces/*.csv; do
+  name=$(basename "$f" .csv)
+  gputrace export --input "$f" --format k8s_sim --out-dir "traces/$name"
+done
+python3 experiments/full_scenario_matrix.py --traces-dir traces --out full_matrix_results.csv
+
+# for the 8 node-granularity policies' realistic, time-driven comparison
+# (rejection rate under actual arrival timing, wait times) -- H-TAFM can't
+# participate, it has no time-driven mode:
+python3 -m k8s_sim.experiment --traces-dir traces \
+    --policies fgd,best_fit,random,worst_fit,least_requested,round_robin,gpu_packing,first_fit \
+    --seeds 1,2,3 --mode time-driven --out timedriven_results.csv
+```
+
+**A genuine finding from running this**: at the time this was written, 5 of
+gputrace's 14 scenarios (`checkpoint_io_burst`, `heavy_tail_demand`,
+`long_context_kv_pressure`, `moe_expert_load_skew`, `spot_preemption_churn`)
+produced pod-level `num_gpu`/`num_cpu`/`duration`/`gpu_type` values
+byte-identical to `baseline` at the seed tested -- only `submit_time`
+differed. That's expected/correct for the scenarios whose whole design is
+about arrival *timing* (checkpoint bursts, spot churn), and their effect
+does show up clearly in time-driven wait times. But it's a real, worth-
+checking discrepancy for `heavy_tail_demand` specifically, whose own name
+and gputrace's documentation describe a *resource-size* change (a fatter
+GPU/CPU demand tail) that wasn't observed in this run -- worth verifying
+against gputrace's current `generators/stress_scenarios.py` if you're
+relying on that scenario's resource-size behavior specifically.
+
 ## H-TAFM (Hypergraph-based Topology-Aware Fragmentation Metric)
 
 `k8s_sim/topology.py` + `k8s_sim/htafm.py` implement a second, independent

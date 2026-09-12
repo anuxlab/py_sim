@@ -1,0 +1,57 @@
+{
+  "run_id": "2026-09-12_fgd_vs_wfgd_htafm",
+  "purpose": "Compare w_fgd / w_fgd_balanced against fgd and every other registered algorithm (8 node policies + 3 H-TAFM variants) across every gputrace stress scenario, with broader (fairness/tail-latency/SLA/efficiency) metrics.",
+  "gputrace": {
+    "package_version": "1.0.0",
+    "git_commit": "31dfbf0",
+    "git_remote": "https://github.com/anuxlab/simulated_data_generation_GPU_Scheduling.git",
+    "note": "commit hash of the clone this run was generated from -- verify this matches the live repo's HEAD at reproduction time if you need byte-identical scenario logic; only CI/lint config was changed relative to it, not generators/, so behavior should match any commit descended from it."
+  },
+  "generation": {
+    "command": "gputrace generate-all --n-jobs 300 --seed 42 --out-dir gputrace_raw",
+    "n_jobs_per_scenario": 300,
+    "seed": 42,
+    "fit_source": "reference (no --fit passed; gputrace's built-in reference_fit(), NOT a real trace -- see gputrace README's own caveat about this)",
+    "scenarios": [
+      "baseline", "bursty_arrivals", "heavy_tail_demand", "diurnal_pattern",
+      "high_contention", "flash_crowd", "resource_starvation", "cold_start_storm",
+      "llm_inference_bursty", "long_context_kv_pressure", "spot_preemption_churn",
+      "checkpoint_io_burst", "gpu_fragmentation_sharing", "moe_expert_load_skew"
+    ]
+  },
+  "export": {
+    "command_template": "gputrace export --input <scenario>.csv --format k8s_sim --out-dir gputrace_export/<scenario> --n-nodes 20 --gpus-per-node 8",
+    "n_nodes": 20,
+    "gpus_per_node": 8,
+    "total_gpu_capacity": 160,
+    "node_gpu_types": "mixed (A100/V100/T4/H100 weighted by scenario's gpu_type distribution -- see gputrace_bridge.py)"
+  },
+  "py_sim": {
+    "git_commit_this_run_was_built_on": "see git log -1 in this repo at time of running reproduce.sh",
+    "algorithms_evaluated": [
+      "random", "first_fit", "best_fit", "worst_fit", "round_robin",
+      "gpu_packing", "least_requested", "fgd", "w_fgd", "w_fgd_balanced",
+      "h-tafm-cut", "h-tafm-entropy", "h-tafm-hier"
+    ],
+    "w_fgd_balanced_hyperparameter": {"balance_lambda": 0.15}
+  },
+  "sweeps_run": {
+    "static_matrix": {
+      "script": "experiments/full_scenario_matrix.py",
+      "command": "python3 experiments/full_scenario_matrix.py --traces-dir gputrace_export --out results/static_matrix_results.csv",
+      "seeds": "n/a (static mode is deterministic given a fixed pod order for every policy except 'random')"
+    },
+    "time_driven": {
+      "script": "k8s_sim.experiment",
+      "command": "python3 -m k8s_sim.experiment --traces-dir gputrace_export --policies random,first_fit,best_fit,worst_fit,round_robin,gpu_packing,least_requested,fgd,w_fgd,w_fgd_balanced --seeds 1,2,3 --mode time-driven --out results/timedriven_results.csv",
+      "seeds": [1, 2, 3]
+    },
+    "broader_metrics": {
+      "script": "experiments/broader_metrics.py",
+      "command": "python3 experiments/broader_metrics.py --traces-dir gputrace_export --policies random,first_fit,best_fit,worst_fit,round_robin,gpu_packing,least_requested,fgd,w_fgd,w_fgd_balanced --seeds 1,2,3 --out results/broader_metrics_timedriven.csv --out-static results/broader_metrics_static.csv",
+      "seeds": [1, 2, 3],
+      "sla_threshold_seconds": 60.0
+    }
+  },
+  "reproduce": "See reproduce.sh in this directory -- runs the exact 3 commands above against the archived gputrace_raw/ + gputrace_export/ data already checked into this directory, so this reproduces even if gputrace's scenario generation logic later changes upstream. To regenerate the raw data from scratch instead (e.g. to test against a newer gputrace version), delete gputrace_raw/ and gputrace_export/ and re-run the generation+export commands above with the same seed."
+}

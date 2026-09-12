@@ -104,6 +104,32 @@ jobs:
       - name: Verify every registered policy passes the compatibility contract
         run: python3 -m pytest tests/test_k8s_sim.py -k "every_policy" -v
 
+  htafm-check:
+    # H-TAFM (k8s_sim/topology.py + htafm.py) is a separate placement engine
+    # from the node-granularity POLICIES registry (NUMA-vertex granularity,
+    # its own Topology/HTAFMScheduler -- see README's "H-TAFM" section), so
+    # it isn't covered by new-policy-check above and needs its own gate.
+    # tests/test_htafm.py is dedicated unit coverage (topology construction,
+    # capacity conservation, all 3 variants' scheduling and TAFI-score
+    # behavior) that didn't exist before this fix -- H-TAFM previously had
+    # only demo-script-level smoke coverage via htafm_demo.py, run here too
+    # since it's the only place that exercises the real bundled trace data
+    # end to end (the unit tests use small synthetic clusters for speed and
+    # determinism).
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - name: Run H-TAFM unit tests (topology construction, all 3 variants)
+        run: python3 -m pytest tests/test_htafm.py -v
+      - name: Smoke-test H-TAFM against the real bundled trace data
+        run: python3 htafm_demo.py 300
+
   gputrace-integration:
     # The real cross-repo integration test: install gputrace from its repo,
     # generate every stress scenario, export to k8s_sim's native format, and

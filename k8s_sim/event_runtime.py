@@ -126,9 +126,13 @@ class EventDrivenRunner:
         self._policy_fn = get_policy(config.policy)
 
     def run(self, events: List[TimedPodEvent], typical_pods: Optional[List[PodResource]] = None,
+            typical_weights: Optional[List[float]] = None,
             track_fragmentation_every: Optional[int] = None) -> RunResult:
         """Run the full discrete-event simulation. ``events`` must already
         be sorted by submit_time (both bridge loaders guarantee this).
+
+        ``typical_weights``: optional, only consumed by weight-aware
+        policies (w_fgd, w_fgd_balanced) -- see Cluster.schedule_pod.
 
         ``track_fragmentation_every``: if set, records
         (sim_time, cluster_fragmentation_score) every N processed arrivals
@@ -155,7 +159,8 @@ class EventDrivenRunner:
 
         def try_place(ev: TimedPodEvent, now: float) -> bool:
             node_id = self.cluster.schedule_pod(
-                ev.pod, policy=self.config.policy, typical_pods=typical_pods, rng=rng
+                ev.pod, policy=self.config.policy, typical_pods=typical_pods,
+                typical_weights=typical_weights, rng=rng
             )
             if node_id is None:
                 return False

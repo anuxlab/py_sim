@@ -18,7 +18,7 @@ from typing import Callable, Dict, List, Optional
 
 import numpy as np
 
-from .fragmentation import unfit_fraction
+from .fragmentation import unfit_fraction, unfit_fraction_weighted
 from .resource import NodeResource, PodResource
 
 PolicyFn = Callable[..., Optional[NodeResource]]
@@ -147,6 +147,85 @@ def fragmentation_gradient_descent(
     return min(feasible, key=score_after_placement)
 
 
+def w_fgd(
+    pod: PodResource, nodes: List[NodeResource], *, typical_pods: Optional[List[PodResource]] = None,
+    typical_weights: Optional[List[float]] = None, **_
+) -> Optional[NodeResource]:
+    """Weighted FGD: identical greedy 1-step gradient-descent structure to
+    fragmentation_gradient_descent above, but scores nodes with
+    unfit_fraction_weighted instead of unfit_fraction -- i.e. using
+    frequency-weighted, joint-sampled typical pod shapes (see
+    fragmentation.build_typical_pods_weighted) instead of FGD's uniformly-
+    weighted, per-dimension-quantile shapes. Falls back to plain FGD (and
+    from there to best_fit) if typical_weights isn't supplied, so it's
+    always safe to call even without the weighted shape set precomputed.
+    """
+    feasible = _feasible(pod, nodes)
+    if not feasible:
+        return None
+    if not typical_pods:
+        return best_fit(pod, nodes)
+    if not typical_weights:
+        return fragmentation_gradient_descent(pod, nodes, typical_pods=typical_pods)
+
+    def score_after_placement(n: NodeResource) -> float:
+        before = unfit_fraction_weighted(n, typical_pods, typical_weights)
+        n.remaining_milli_cpu -= pod.milli_cpu
+        n.remaining_milli_gpu -= pod.milli_gpu
+        n.remaining_gpu_count -= pod.gpu_number
+        after = unfit_fraction_weighted(n, typical_pods, typical_weights)
+        n.remaining_milli_cpu += pod.milli_cpu
+        n.remaining_milli_gpu += pod.milli_gpu
+        n.remaining_gpu_count += pod.gpu_number
+        return after - before
+
+    return min(feasible, key=score_after_placement)
+
+
+def w_fgd_balanced(
+    pod: PodResource, nodes: List[NodeResource], *, typical_pods: Optional[List[PodResource]] = None,
+    typical_weights: Optional[List[float]] = None, balance_lambda: float = 0.15, **_
+) -> Optional[NodeResource]:
+    """w_fgd plus a slack-preservation regularization term: among nodes
+    that are close to tied on the weighted-fragmentation delta, prefer the
+    one that leaves MORE nodes still completely empty, on the theory that
+    a fully-empty node is strictly more valuable for an unknown future
+    large/multi-GPU job than a partially-filled one at the same
+    utilization level -- FGD (weighted or not) only optimizes the
+    *current* fragmentation snapshot and has no explicit notion of
+    preserving this kind of optionality for demand it hasn't seen yet.
+
+    score = weighted_frag_delta + balance_lambda * (this node's post-
+    placement GPU utilization), minimized. balance_lambda=0 reduces
+    exactly to w_fgd; the default (0.15) was chosen by a small grid search
+    (see docs/algorithms.md) trading off a modest fragmentation cost
+    against a measurable gain in large-job admission -- tune it for your
+    own workload's size distribution if you have one.
+    """
+    feasible = _feasible(pod, nodes)
+    if not feasible:
+        return None
+    if not typical_pods:
+        return best_fit(pod, nodes)
+    if not typical_weights:
+        return fragmentation_gradient_descent(pod, nodes, typical_pods=typical_pods)
+
+    def score_after_placement(n: NodeResource) -> float:
+        before = unfit_fraction_weighted(n, typical_pods, typical_weights)
+        n.remaining_milli_cpu -= pod.milli_cpu
+        n.remaining_milli_gpu -= pod.milli_gpu
+        n.remaining_gpu_count -= pod.gpu_number
+        after = unfit_fraction_weighted(n, typical_pods, typical_weights)
+        gpu_util_after = ((n.milli_gpu_capacity - n.remaining_milli_gpu) / n.milli_gpu_capacity
+                           if n.milli_gpu_capacity else 0.0)
+        n.remaining_milli_cpu += pod.milli_cpu
+        n.remaining_milli_gpu += pod.milli_gpu
+        n.remaining_gpu_count += pod.gpu_number
+        return (after - before) + balance_lambda * gpu_util_after
+
+    return min(feasible, key=score_after_placement)
+
+
 POLICIES: Dict[str, PolicyFn] = {
     "random": random_fit,
     "first_fit": first_fit,
@@ -156,6 +235,8 @@ POLICIES: Dict[str, PolicyFn] = {
     "gpu_packing": gpu_packing,
     "least_requested": least_requested,
     "fgd": fragmentation_gradient_descent,
+    "w_fgd": w_fgd,
+    "w_fgd_balanced": w_fgd_balanced,
 }
 
 

@@ -35,10 +35,12 @@ from typing import List
 
 from .cluster import Cluster
 from .event_runtime import EventDrivenRunner, RunConfig
-from .fragmentation import build_typical_pods
+from .fragmentation import build_typical_pods, build_typical_pods_weighted
 from .gputrace_bridge import load_gputrace_export
 from .policies import list_policies
 from .trace import reset_cluster
+
+_WEIGHT_AWARE_POLICIES = {"w_fgd", "w_fgd_balanced"}
 
 
 def _scale_events(events, factor: float):
@@ -93,13 +95,19 @@ def run_time_driven_sweep(traces_dir: Path, policies: List[str], seeds: List[int
         for scale in scales:
             events = _scale_events(base_events, scale)
             typical_pods = build_typical_pods([e.pod for e in events])
+            w_shapes, w_weights = build_typical_pods_weighted([e.pod for e in events])
 
             for policy in policies:
+                weight_aware = policy in _WEIGHT_AWARE_POLICIES
                 for seed in seeds:
                     nodes = reset_cluster(base_nodes)
                     cluster = Cluster(nodes)
                     runner = EventDrivenRunner(cluster, RunConfig(policy=policy, seed=seed))
-                    result = runner.run(events, typical_pods=typical_pods)
+                    result = runner.run(
+                        events,
+                        typical_pods=w_shapes if weight_aware else typical_pods,
+                        typical_weights=w_weights if weight_aware else None,
+                    )
 
                     rows.append({
                         "scenario": scenario,
@@ -136,12 +144,19 @@ def run_static_sweep(traces_dir: Path, policies: List[str], seeds: List[int]) ->
         base_nodes = load_nodes_csv(scenario_dir / "nodes.csv")
         pods = load_pods_csv(scenario_dir / "pods.csv")
         typical_pods = build_typical_pods(pods)
+        w_shapes, w_weights = build_typical_pods_weighted(pods)
 
         for policy in policies:
+            weight_aware = policy in _WEIGHT_AWARE_POLICIES
             for seed in seeds:
                 nodes = reset_cluster(base_nodes)
                 cluster = Cluster(nodes)
-                results = cluster.schedule_pods(pods, policy=policy, typical_pods=typical_pods, seed=seed)
+                results = cluster.schedule_pods(
+                    pods, policy=policy,
+                    typical_pods=w_shapes if weight_aware else typical_pods,
+                    typical_weights=w_weights if weight_aware else None,
+                    seed=seed,
+                )
                 n_admitted = sum(1 for r in results if r.node_id is not None)
                 rows.append({
                     "scenario": scenario,

@@ -42,13 +42,17 @@ class Cluster:
 
     def schedule_pod(self, pod: PodResource, policy: str = "first_fit",
                       typical_pods: Optional[List[PodResource]] = None,
+                      typical_weights: Optional[List[float]] = None,
                       rng: Optional[np.random.Generator] = None) -> Optional[str]:
         """Attempt to place a single pod using the named policy. Returns
-        the chosen node_id, or None if no node had room."""
+        the chosen node_id, or None if no node had room. ``typical_weights``
+        is optional and only consumed by weight-aware policies (w_fgd,
+        w_fgd_balanced) -- every other policy's signature has a ``**_``
+        catch-all and ignores it, so this is fully backward compatible."""
         fn = get_policy(policy)
         chosen = fn(
             pod, self.node_list,
-            rng=rng, typical_pods=typical_pods,
+            rng=rng, typical_pods=typical_pods, typical_weights=typical_weights,
             round_robin_state=self._round_robin_state,
         )
         if chosen is None:
@@ -58,6 +62,7 @@ class Cluster:
 
     def schedule_pods(self, pods: List[PodResource], policy: str = "first_fit",
                        typical_pods: Optional[List[PodResource]] = None,
+                       typical_weights: Optional[List[float]] = None,
                        seed: int = 0) -> List[ScheduleResult]:
         """Static batch scheduling: place every pod in ``pods``, in list
         order, against the cluster's current state. Does not model time —
@@ -68,7 +73,8 @@ class Cluster:
         rng = np.random.default_rng(seed)
         results = []
         for pod in pods:
-            node_id = self.schedule_pod(pod, policy=policy, typical_pods=typical_pods, rng=rng)
+            node_id = self.schedule_pod(pod, policy=policy, typical_pods=typical_pods,
+                                         typical_weights=typical_weights, rng=rng)
             results.append(ScheduleResult(pod_id=pod.pod_id, node_id=node_id))
         return results
 
